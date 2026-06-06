@@ -7,9 +7,9 @@ stock-PyTorch talker layer to within bf16 noise (max abs diff 0.0078). Next: fix
 output stage vocab (3072) + the 16-code path (Phase 4b).
 
 This folder groups everything about porting the `AlpinDale/qwen_megakernel` CUDA kernel
-to drive the **Qwen3-TTS talker**. The kernel source itself lives in the separate
-`pipecat-qwen` repo under `qwen_megakernel/`; this folder is the plan, the runbook, the
-verified results, and the helper scripts.
+to drive the **Qwen3-TTS talker**: the vendored kernel source, the port, the tests, the
+runbook, and the verified results. The kernel source is vendored under
+`qwen_megakernel/` so the **whole thing clones to the box in one go** — no separate repo.
 
 ## Folder layout
 
@@ -21,7 +21,12 @@ megakernel/
 ├── check_positions.py    ← helper: prove MRoPE collapses to plain 1D
 ├── capture_reference.py  ← helper: save stock-PyTorch talker hidden states (ground truth)
 ├── model_tts.py          ← THE PORT: talker weight loader (theta, vocab, untied head)
-├── parity_single.py      ← THE TEST: single-layer kernel-vs-PyTorch parity (Phase 4a)
+├── parity_single.py      ← Phase 4a test: single-layer kernel-vs-PyTorch parity (PASSED)
+├── parity_code0.py       ← Phase 4b test: full-decode codebook-0 parity (needs recompile)
+├── qwen_megakernel/      ← VENDORED kernel source (AlpinDale/qwen_megakernel + our edits)
+│   ├── csrc/kernel.cu        (LDG_VOCAB_SIZE now a build-overridable macro)
+│   ├── qwen_megakernel/      (model.py, build.py, bench.py — Python side)
+│   └── requirements.txt
 └── docs/
     ├── 2026-06-06-megakernel-roadmap.md     ← why the fast path exists (context)
     └── 2026-06-06-megakernel-vast-setup.md  ← step-by-step Vast.ai runbook
@@ -29,19 +34,34 @@ megakernel/
 
 | File | What it is |
 |------|------------|
-| `README.md` (this file) | **Verified results** + exact weight names + the grounded Phase 4a recipe + the parity result. |
-| `docs/2026-06-06-megakernel-roadmap.md` | Why the fast path exists, how it connects to this repo. Start here for context. |
-| `docs/2026-06-06-megakernel-vast-setup.md` | Step-by-step Vast.ai runbook (rent 5090 → verify → compile → GO/NO-GO). |
+| `README.md` (this file) | **Verified results** + exact weight names + the grounded recipe + parity results. |
+| `qwen_megakernel/` | Vendored CUDA kernel (upstream + our edits: `LDG_VOCAB_SIZE` build flag). The JIT compiles `csrc/kernel.cu` on first run. |
+| `model_tts.py` | **The port.** Loads talker weights into the kernel format (theta=1e6, vocab 3072, untied `codec_head`). Reuses the kernel `Decoder` unchanged. |
+| `parity_single.py` | **Phase 4a test (PASSED).** One token, one layer, kernel vs PyTorch hidden state. |
+| `parity_code0.py` | **Phase 4b test.** Full 28-layer decode → codebook-0 token, kernel vs PyTorch. Needs `LDG_VOCAB_SIZE=3072` recompile. |
+| `capture_reference.py` | Runs the stock-PyTorch talker and saves per-step hidden states as ground truth. |
+| `check_positions.py` | Hooks the talker's rotary embed and prints real `position_ids` — proves MRoPE collapses to plain 1D. |
 | `check_cfg.py` | Registers the `qwen3_tts` arch and prints the talker config (the GO/NO-GO check). |
 | `dump_weights.py` | Loads the model and prints the talker's weight key names + shapes. |
-| `check_positions.py` | Hooks the talker's rotary embed and prints real `position_ids` — proves MRoPE collapses to plain 1D. |
-| `capture_reference.py` | Runs the stock-PyTorch talker and saves per-step hidden states as ground truth. |
-| `model_tts.py` | **The port.** Loads talker weights into the kernel format (theta=1e6, vocab 3072, untied `codec_head`). Reuses the kernel `Decoder` unchanged. |
-| `parity_single.py` | **The Phase 4a test.** Runs one token through one layer in both the ported kernel and stock PyTorch, compares hidden states. |
+| `docs/2026-06-06-megakernel-roadmap.md` | Why the fast path exists, how it connects to this repo. |
+| `docs/2026-06-06-megakernel-vast-setup.md` | Step-by-step Vast.ai runbook. |
 
-> The scripts run **on the rented box**, not the Mac (they need the GPU + model). `model_tts.py`
-> and `parity_single.py` must sit **inside the cloned kernel repo dir** so `qwen_megakernel`
-> imports. Copy their contents over, run, paste output back.
+> Scripts run **on the rented box** (they need the GPU + model). The port/test files import
+> `qwen_megakernel`, so run them **from inside `megakernel/qwen_megakernel/`** (or add it to
+> `PYTHONPATH`). See "Running on the box" below.
+
+## Running on the box (one clone)
+
+```bash
+git clone <your voice-agent repo>            # whole repo, kernel included
+cd voice-agent/megakernel/qwen_megakernel    # so `import qwen_megakernel` resolves
+pip install qwen-tts                          # TTS model stack (registers qwen3_tts)
+cp ../model_tts.py ../parity_single.py ../parity_code0.py .   # bring port+tests alongside
+
+python -m qwen_megakernel.bench              # (optional) prove the kernel builds
+python parity_single.py                      # Phase 4a body parity  -> PASS
+LDG_VOCAB_SIZE=3072 python parity_code0.py   # Phase 4b code0 parity (recompiles for 3072)
+```
 
 ---
 

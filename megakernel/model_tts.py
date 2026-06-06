@@ -113,6 +113,17 @@ def load_talker_weights(model_name: str = MODEL_ID, verbose: bool = True):
 def build_talker_decoder(verbose: bool = True):
     """Build a kernel Decoder wired to the talker weights, reusing the kernel's
     Decoder machinery unchanged. Returns (decoder, full_model)."""
+    # Make `import qwen_megakernel` resolve whether we're run from megakernel/ or
+    # from inside the vendored kernel dir. The vendored kernel lives at
+    # megakernel/qwen_megakernel/ (a repo dir containing the qwen_megakernel pkg).
+    import os, sys
+    here = os.path.dirname(os.path.abspath(__file__))
+    for cand in (os.path.join(here, "qwen_megakernel"), here):
+        if os.path.isdir(os.path.join(cand, "qwen_megakernel")):
+            if cand not in sys.path:
+                sys.path.insert(0, cand)
+            break
+
     from qwen_megakernel.model import Decoder
 
     weights, model = load_talker_weights(verbose=verbose)
