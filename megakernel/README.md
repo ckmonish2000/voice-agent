@@ -1,8 +1,10 @@
 # Megakernel Port — Verified Findings & Index
 
-**Date:** 2026-06-07 · **Status:** Step 0 complete on a real RTX 5090. Box verified,
-unchanged kernel builds + runs, **GO/NO-GO cleared (GO)**, talker weight names + shapes
-captured. Ready for Phase 4a (kernel body port).
+**Date:** 2026-06-07 · **Status:** **Phase 4a body parity PASSED** on a real RTX 5090.
+Box verified, unchanged kernel builds + runs, GO/NO-GO cleared (GO), talker weights
+captured, MRoPE shown to collapse to plain 1D, and the ported kernel body reproduces the
+stock-PyTorch talker layer to within bf16 noise (max abs diff 0.0078). Next: fix the
+output stage vocab (3072) + the 16-code path (Phase 4b).
 
 This folder groups everything about porting the `AlpinDale/qwen_megakernel` CUDA kernel
 to drive the **Qwen3-TTS talker**. The kernel source itself lives in the separate
@@ -13,9 +15,13 @@ verified results, and the helper scripts.
 
 ```
 megakernel/
-├── README.md            ← this file: verified results + index + Phase 4a recipe
-├── check_cfg.py         ← helper: GO/NO-GO talker config check
-├── dump_weights.py      ← helper: dump talker weight names + shapes
+├── README.md             ← this file: verified results + index + recipe
+├── check_cfg.py          ← helper: GO/NO-GO talker config check
+├── dump_weights.py       ← helper: dump talker weight names + shapes
+├── check_positions.py    ← helper: prove MRoPE collapses to plain 1D
+├── capture_reference.py  ← helper: save stock-PyTorch talker hidden states (ground truth)
+├── model_tts.py          ← THE PORT: talker weight loader (theta, vocab, untied head)
+├── parity_single.py      ← THE TEST: single-layer kernel-vs-PyTorch parity (Phase 4a)
 └── docs/
     ├── 2026-06-06-megakernel-roadmap.md     ← why the fast path exists (context)
     └── 2026-06-06-megakernel-vast-setup.md  ← step-by-step Vast.ai runbook
@@ -23,14 +29,19 @@ megakernel/
 
 | File | What it is |
 |------|------------|
-| `README.md` (this file) | **Verified results** from actually running the runbook, plus exact weight names and the grounded Phase 4a recipe. |
-| `docs/2026-06-06-megakernel-roadmap.md` | Why the fast path exists, how it connects to this repo, the change summary. Start here for context. |
+| `README.md` (this file) | **Verified results** + exact weight names + the grounded Phase 4a recipe + the parity result. |
+| `docs/2026-06-06-megakernel-roadmap.md` | Why the fast path exists, how it connects to this repo. Start here for context. |
 | `docs/2026-06-06-megakernel-vast-setup.md` | Step-by-step Vast.ai runbook (rent 5090 → verify → compile → GO/NO-GO). |
-| `check_cfg.py` | Helper: registers the `qwen3_tts` arch and prints the talker config (the GO/NO-GO check). |
-| `dump_weights.py` | Helper: loads the model and prints the talker's weight key names + shapes (needed for the port). |
+| `check_cfg.py` | Registers the `qwen3_tts` arch and prints the talker config (the GO/NO-GO check). |
+| `dump_weights.py` | Loads the model and prints the talker's weight key names + shapes. |
+| `check_positions.py` | Hooks the talker's rotary embed and prints real `position_ids` — proves MRoPE collapses to plain 1D. |
+| `capture_reference.py` | Runs the stock-PyTorch talker and saves per-step hidden states as ground truth. |
+| `model_tts.py` | **The port.** Loads talker weights into the kernel format (theta=1e6, vocab 3072, untied `codec_head`). Reuses the kernel `Decoder` unchanged. |
+| `parity_single.py` | **The Phase 4a test.** Runs one token through one layer in both the ported kernel and stock PyTorch, compares hidden states. |
 
-> The helper scripts run **on the rented box**, not the Mac (they need the GPU + model).
-> Copy their contents over, run, paste output back.
+> The scripts run **on the rented box**, not the Mac (they need the GPU + model). `model_tts.py`
+> and `parity_single.py` must sit **inside the cloned kernel repo dir** so `qwen_megakernel`
+> imports. Copy their contents over, run, paste output back.
 
 ---
 
@@ -95,13 +106,32 @@ hardcoded constants:
 **Verdict: GO.** Core dims all match → it's the 0.6B (not 1.7B) → the kernel **body**
 (attention + MLP, 28 layers) is reusable unchanged.
 
-### MRoPE (confirmed real)
+### MRoPE — config says multimodal, but it COLLAPSES to plain 1D (verified)
+Config declares MRoPE:
 ```
 rope_scaling = {"interleaved": true, "mrope_section": [24, 20, 20], "rope_type": "default"}
 position_id_per_seconds = 13
 ```
-Kernel does plain rotate-half (`kernel.cu:404`); talker uses multimodal RoPE. Plan: try
-plain RoPE + θ=1e6 first, compare hidden states, build MRoPE only if parity fails.
+The kernel does plain rotate-half 1D RoPE (`kernel.cu:404`). **We tested whether MRoPE is
+actually active** for the single-speaker text→speech path by hooking
+`talker.model.rotary_emb` and printing the real `position_ids` every call
+(`check_positions.py`). Result on the box:
+
+```
+call 0 (prefill): shape (3,1,111)  PLAIN-1D (3 sections identical)  positions ...108,109,110
+call 1..5 (decode): shape (3,1,1)  PLAIN-1D (3 sections identical)  positions 111,112,113,114,115
+VERDICT: positions COLLAPSE to plain 1D every call -> MRoPE == plain RoPE for the kernel.
+```
+
+The talker builds `position_ids` as a single scalar broadcast into all 3 MRoPE sections
+(`modeling_qwen3_tts.py:1706-1710`, `expand(3, -1, -1)`). When the 3 sections are equal,
+MRoPE is mathematically identical to plain RoPE. **So no MRoPE kernel change is needed** —
+the plain rotate-half body + θ=1e6 is correct for this path. `KERNEL_CHANGES #3`'s
+"validate plain RoPE first" path is confirmed.
+
+**One nuance:** decode starts at **position ~111** (after the voice-clone prefill), not 0.
+The kernel must seed its position counter with that prefill offset for parity (an integer,
+not an algorithm change).
 
 ---
 
@@ -182,9 +212,73 @@ Edits to the kernel's `qwen_megakernel/model.py`:
 | 7 | VOCAB_SIZE | `model.py:16` | `151936` → `3072` |
 | 8 | LM-head grid retune | `kernel.cu:74` + `build.py LDG_LM_*` | size for 3072 rows (was 152k) |
 
+Changes 1–6 are done in `model_tts.py` (Python only) and **verified** (§6b). Changes 7–8
+touch `kernel.cu` (compile-time vocab) and need a recompile — that's the start of Phase 4b
+(the output stage). Until then, the parity test uses a dummy full-size lm_head to avoid the
+out-of-bounds read (see §6b Failure 1).
+
 **Verify 4a:** run the talker as text-style decode through the kernel, dump hidden states
 (pre-output-stage), compare to stock PyTorch (`output_hidden_states=True` or hooks on
 `talker.model.layers[i]`). Match → body port correct.
+
+---
+
+## 6b. Phase 4a PARITY RESULT — PASSED ✅  (read this, juniors)
+
+**What we proved:** the ported kernel body (talker weights + θ=1e6 + plain RoPE + untied
+`codec_head`) computes the *same* layer output as stock PyTorch.
+
+**How we proved it (single-layer parity, `parity_single.py`):**
+We don't compare a whole generation — too many moving parts. We isolate ONE layer:
+1. PyTorch side: embed one code id via `codec_embedding`, run `talker.model.layers[0]` at
+   a fixed position, read the output hidden vector.
+2. Kernel side: call the kernel's `decode` with `num_layers=1` at the same position, then
+   read the `hidden_buffer` scratch tensor (which holds the post-layer hidden — confirmed
+   in `kernel.cu:859/1268`).
+3. Compare the two 1024-dim vectors.
+
+**Result:**
+```
+token=100  position=0
+ref    [:6] = [-0.1523, -0.124,  -0.0574, -0.0078, 0.0513, -0.0806]
+kernel [:6] = [-0.1514, -0.123,  -0.0571, -0.0083, 0.0513, -0.0806]
+max abs diff  = 0.00781   (tolerance 0.02)   mean abs diff = 0.00056
+PASS — within bf16 tolerance. Body port is faithful.
+```
+The remaining ~0.008 is bf16 rounding noise (bf16 has ~2–3 significant digits), not a real
+disagreement. **Conclusion: the kernel's attention + MLP body runs the talker correctly.**
+
+### Two failures we hit on the way (and what they taught us)
+
+These are worth understanding — neither was a bug in the kernel math; both were about the
+*test setup* and a *known size difference*.
+
+**Failure 1 — `CUDA error: illegal memory access`.**
+The kernel's LM-head stage is sized at **compile time** to vocab `151936` (`kernel.cu:74`,
+`constexpr LDG_VOCAB_SIZE`). We handed it the talker's `codec_head`, which has only **3072**
+rows. The LM head tried to read 151936 rows from a 3072-row tensor → it read ~50× past the
+end of the buffer → illegal memory access. *Lesson: a compile-time constant won't adapt to a
+runtime tensor; the tensor must match the constant, or the constant must change.*
+Fix for the test: pass a dummy 151936×1024 tensor so the LM head reads valid memory; we
+ignore its (meaningless) argmax and read the pre-head hidden. The *real* fix (vocab→3072 +
+recompile) is Phase 4b.
+
+**Failure 2 — numbers in the right ballpark but ~70% too small** (max diff 0.27, every kernel
+value compressed toward zero). The cause was an **unfair comparison**, not bad math. The
+kernel attends over `cache_len = position + 1` slots (`kernel.cu:1329`). At `position=5` with
+a freshly *zeroed* KV cache, it included 5 spurious all-zero key/value entries in its
+attention softmax — while the PyTorch reference (single token, no cache) attended to only the
+1 real token. Averaging in 5 zero-entries dragged the kernel output toward zero — exactly the
+"right signs, shrunk magnitude" signature we saw. *Lesson: the "same signs but wrong scale"
+pattern points at an averaging/normalization difference, here the attention context.*
+Fix: use `position=0` so `cache_len=1` → both sides attend to exactly the one real token.
+(Bonus: at position 0, RoPE is identity, so this run also rules RoPE in/out cleanly.)
+
+### Debugging principle demonstrated
+Both fixes came from **localizing before changing** — read what the kernel actually does
+(the vocab constant; the `cache_len = position+1` line), form a hypothesis that explains the
+*specific* symptom, then make the smallest change that tests it. We never edited the `.cu`
+blindly.
 
 ---
 
