@@ -1,0 +1,355 @@
+"""
+StreamingTTSEngine — the streaming seam.
+
+This is the piece the RTX 5090 megakernel replaces later. Everything above it
+(WebSocket server, Pipecat service) is model-independent and never changes.
+
+What it does
+------------
+Turns the existing batched `model.generate()` path (which returns the whole
+(T,16) codes tensor at once — "buffered then sent") into a frame-by-frame
+generator:
+
+    text  ──▶  per-step (1,16) audio codes  ──▶  per-hop 24 kHz PCM tail
+
+How streaming is achieved without reimplementing HF sampling
+------------------------------------------------------------
+The talker is a normal `GenerationMixin` model: its per-step `forward` emits one
+frame of 16 codes (codebook 0 from `codec_head`, codes 1..15 from the 5-layer
+`code_predictor`) and HF's `generate()` loop drives it. We do NOT rewrite that
+loop — instead we:
+
+  1. Run `model.generate(...)` in a background thread.
+  2. Register a `forward` hook on the talker module. HF invokes talker.forward
+     once per generated step; the hook reads that step's `codec_ids` (the full
+     16-code frame, returned as `output.hidden_states[1]`) and pushes it onto a
+     thread-safe queue in real time.
+  3. The foreground thread drains the queue frame-by-frame, runs a sliding-window
+     codec decode, and yields the newly revealed PCM tail.
+
+A forward hook is used (not a LogitsProcessor) because qwen_tts's
+`model.generate()` does not thread a `logits_processor` through to the talker —
+but the talker is a real `nn.Module`, so a forward hook fires every step.
+
+Because the exact same sampling path runs, the streamed codes are identical to
+the batched path by construction — that's what `parity_check.py` asserts.
+
+The megakernel seam is the talker decode step. To swap it in later, replace the
+generate() call's talker backend; the queue/codec/PCM machinery is untouched.
+"""
+
+import os
+import sys
+import queue
+import threading
+from dataclasses import dataclass, field
+from typing import Iterator, Optional
+
+import torch
+
+sys.path.insert(0, os.path.dirname(__file__))
+from common import load_model  # noqa: E402  (shared Qwen3-TTS model loader)
+
+# Voice-clone reference (same clip the stage scripts use).
+REF_AUDIO = "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen3-TTS-Repo/clone.wav"
+REF_TEXT = (
+    "Okay. Yeah. I resent you. I love you. I respect you. But you know what? "
+    "You blew it! And thanks to you."
+)
+
+# Sliding-window codec decode parameters. The 12 Hz codec uses sliding-window
+# attention + causal transpose-conv upsampling, so a frame's waveform depends on
+# its neighbours. We decode a rolling window and emit only the new tail.
+DEFAULT_WINDOW = 16   # frames kept as decode context
+DEFAULT_HOP = 4       # decode + emit every HOP new frames
+UPSAMPLE = 1920       # samples per frame at 24 kHz (12.5 Hz * 1920 = 24000)
+SAMPLE_RATE = 24000
+
+_FRAME_SENTINEL = None  # pushed onto the queue to signal generation finished
+
+
+@dataclass
+class StreamConfig:
+    max_new_tokens: int = 512
+    window: int = DEFAULT_WINDOW
+    hop: int = DEFAULT_HOP
+    seed: Optional[int] = None  # set for deterministic parity runs
+    # sampling (mirror the wrapper defaults so parity holds against generate())
+    do_sample: bool = True
+    temperature: float = 0.9
+    top_k: int = 50
+
+
+@dataclass
+class StreamMetrics:
+    """Filled in as a stream runs; read by metrics.py / the server."""
+    num_frames: int = 0
+    first_frame_t: Optional[float] = None   # perf_counter at first code frame
+    last_frame_t: Optional[float] = None
+    start_t: Optional[float] = None
+    frame_arrival_ts: list = field(default_factory=list)  # per-frame perf_counter
+
+    @property
+    def num_codes(self) -> int:
+        return self.num_frames * 16
+
+
+class StreamingTTSEngine:
+    """Loads the model once; streams PCM for each text request."""
+
+    def __init__(self, device: Optional[str] = None):
+        self.model, self.processor, self.device = load_model(device)
+        self._eos = self.model.config.talker_config.codec_eos_token_id
+
+        # Build the official wrapper once — we reuse ONLY its prompt-building and
+        # kwarg-merging helpers, not its (batched) generate path.
+        from qwen_tts import Qwen3TTSModel
+        self._wrapper = Qwen3TTSModel(
+            model=self.model,
+            processor=self.processor,
+            generate_defaults=self.model.generate_config,
+        )
+        self._voice = self._build_voice_clone()
+        self._warmed = False
+
+    def warmup(self, text: str = "warm up") -> None:
+        """Run one throwaway generate so the first real request isn't the cold
+        outlier (the first-ever generate() after load primes lazy model state and
+        produces slightly different output than steady-state calls)."""
+        if self._warmed:
+            return
+        self.generate_batched_codes(text, StreamConfig(do_sample=False, max_new_tokens=8))
+        self._warmed = True
+
+    # ---- one-time voice-clone prompt build (reference voice) ----
+    def _build_voice_clone(self):
+        prompt_items = self._wrapper.create_voice_clone_prompt(
+            ref_audio=REF_AUDIO, ref_text=REF_TEXT, x_vector_only_mode=False
+        )
+        vc_prompt = self._wrapper._prompt_items_to_voice_clone_prompt(prompt_items)
+        ref_tok = self._wrapper._tokenize_texts(
+            [self._wrapper._build_ref_text(REF_TEXT)]
+        )[0]
+        return {
+            "vc_prompt": vc_prompt,
+            "ref_tok": ref_tok,
+            "ref_code": prompt_items[0].ref_code,
+        }
+
+    def _text_to_input_ids(self, text: str) -> torch.Tensor:
+        # Wrap in the chat template the talker was trained on (same as stage1 /
+        # the official wrapper). The generate() path slices input_id[:, :3] and
+        # input_id[:, 3:-5], so this exact framing is required.
+        wrapped = (
+            f"<|im_start|>assistant\n{text}<|im_end|>\n<|im_start|>assistant\n"
+        )
+        enc = self.processor(text=wrapped, return_tensors="pt", padding=True)
+        ids = enc["input_ids"]
+        if ids.dim() == 1:
+            ids = ids.unsqueeze(0)
+        return ids.to(self.device)
+
+    # ---- the streaming entry point ----
+    def decode_stream(
+        self, text: str, cfg: Optional[StreamConfig] = None
+    ) -> Iterator[bytes]:
+        """Yield 24 kHz mono int16 PCM chunks as the talker generates frames.
+
+        This is the megakernel seam: replace the talker decode inside the
+        generate() call and this method's contract is unchanged.
+        """
+        import time
+
+        cfg = cfg or StreamConfig()
+        metrics = self.last_metrics = StreamMetrics()
+        metrics.start_t = time.perf_counter()
+
+        if cfg.seed is not None:
+            torch.manual_seed(cfg.seed)
+
+        input_ids = self._text_to_input_ids(text)
+        gen_kwargs = self._wrapper._merge_generate_kwargs(
+            max_new_tokens=cfg.max_new_tokens,
+            do_sample=cfg.do_sample,
+            temperature=cfg.temperature,
+            top_k=cfg.top_k,
+        )
+
+        frame_q: "queue.Queue" = queue.Queue()
+        self._install_frame_hook(frame_q, metrics)
+
+        def _run_generate():
+            try:
+                with torch.no_grad():
+                    self.model.generate(
+                        input_ids=[input_ids],
+                        ref_ids=[self._voice["ref_tok"]],
+                        voice_clone_prompt=self._voice["vc_prompt"],
+                        languages=["English"],
+                        non_streaming_mode=False,
+                        **gen_kwargs,
+                    )
+            finally:
+                frame_q.put(_FRAME_SENTINEL)
+
+        worker = threading.Thread(target=_run_generate, daemon=True)
+        worker.start()
+
+        # Foreground: drain frames, sliding-window codec decode, emit PCM tail.
+        decoder = _SlidingCodecDecoder(
+            self.model.speech_tokenizer,
+            ref_code=self._voice["ref_code"].to(self.device),
+            window=cfg.window,
+            hop=cfg.hop,
+            device=self.device,
+        )
+        try:
+            while True:
+                frame = frame_q.get()
+                if frame is _FRAME_SENTINEL:
+                    break
+                pcm = decoder.push(frame.to(self.device))
+                if pcm is not None and len(pcm) > 0:
+                    yield pcm
+            tail = decoder.flush()
+            if tail is not None and len(tail) > 0:
+                yield tail
+        finally:
+            metrics.last_frame_t = time.perf_counter()
+            worker.join(timeout=1.0)
+            self._remove_frame_hook()
+
+    # ---- frame hook: push each step's 16-code frame onto the queue ----
+    def _install_frame_hook(self, frame_q: "queue.Queue", metrics: StreamMetrics):
+        """Push each generated frame to the queue as the talker produces it.
+
+        talker.forward returns hidden_states=(layer_hidden_states, codec_ids).
+        On generate steps (seq len 1) codec_ids is the (1,16) frame for this
+        step; on the prefill step it is None. We forward each real frame
+        immediately, skipping the EOS frame.
+        """
+        talker = self.model.talker
+        eos = self._eos
+
+        def _hook(_module, _inputs, output):
+            import time
+            hs = getattr(output, "hidden_states", None)
+            if not (isinstance(hs, tuple) and len(hs) == 2):
+                return output
+            codec_ids = hs[1]
+            if codec_ids is None:
+                return output  # prefill step
+            frame = codec_ids.detach().to("cpu").view(-1)[:16]
+            if int(frame[0]) == eos:
+                return output
+            now = time.perf_counter()
+            if metrics.first_frame_t is None:
+                metrics.first_frame_t = now
+            metrics.frame_arrival_ts.append(now)
+            metrics.num_frames += 1
+            frame_q.put(frame.clone())
+            return output
+
+        self._hook_handle = talker.register_forward_hook(_hook)
+
+    def _remove_frame_hook(self):
+        h = getattr(self, "_hook_handle", None)
+        if h is not None:
+            h.remove()
+            self._hook_handle = None
+
+    # ---- batched reference path (used by parity_check) ----
+    def generate_batched_codes(self, text: str, cfg: Optional[StreamConfig] = None):
+        """Run the original batched generate() — returns (T,16) codes on CPU."""
+        cfg = cfg or StreamConfig()
+        if cfg.seed is not None:
+            torch.manual_seed(cfg.seed)
+        input_ids = self._text_to_input_ids(text)
+        gen_kwargs = self._wrapper._merge_generate_kwargs(
+            max_new_tokens=cfg.max_new_tokens,
+            do_sample=cfg.do_sample,
+            temperature=cfg.temperature,
+            top_k=cfg.top_k,
+        )
+        with torch.no_grad():
+            codes_list, _ = self.model.generate(
+                input_ids=[input_ids],
+                ref_ids=[self._voice["ref_tok"]],
+                voice_clone_prompt=self._voice["vc_prompt"],
+                languages=["English"],
+                non_streaming_mode=False,
+                **gen_kwargs,
+            )
+        return codes_list[0].detach().cpu()
+
+
+class _SlidingCodecDecoder:
+    """Rolling-window codec decode that emits only newly-revealed PCM.
+
+    The ref-code prefix is prepended once to seed the cloned voice and warm the
+    decoder's sliding-window context, but its samples are never emitted. After
+    that, every HOP frames we decode the last `window` frames and emit the PCM
+    that corresponds to the new hop only, so output is frame-by-frame and
+    glitch-free at boundaries.
+    """
+
+    def __init__(self, speech_tokenizer, ref_code, window, hop, device):
+        self._tok = speech_tokenizer
+        self._ref = ref_code            # (R,16) reference voice codes
+        self._window = window
+        self._hop = hop
+        self._device = device
+        self._buf: list = []            # generated frames (each (16,))
+        self._emitted_frames = 0        # how many generated frames already emitted
+
+    def _decode(self, frames_tensor):
+        """codes (N,16) -> waveform samples (CPU, 1-D)."""
+        import numpy as np
+        codes = torch.cat([self._ref, frames_tensor], dim=0)
+        wavs, _sr = self._tok.decode([{"audio_codes": codes}])
+        wav = wavs[0]
+        if isinstance(wav, torch.Tensor):
+            wav = wav.detach().to("cpu").numpy()
+        else:
+            wav = np.asarray(wav)
+        # drop the samples belonging to the ref prefix
+        ref_samples = self._ref.shape[0] * UPSAMPLE
+        return wav[ref_samples:]
+
+    def push(self, frame) -> Optional[bytes]:
+        self._buf.append(frame.view(-1)[:16])
+        unemitted = len(self._buf) - self._emitted_frames
+        if unemitted < self._hop:
+            return None
+        # decode the tail window for context, emit only the new hop's samples
+        start = max(0, len(self._buf) - self._window)
+        window_frames = torch.stack(self._buf[start:], dim=0).to(self._device)
+        wav = self._decode(window_frames)
+        # samples in this window that precede the new hop are context -> skip
+        new_frames = len(self._buf) - self._emitted_frames
+        window_len = len(self._buf) - start
+        context_frames = window_len - new_frames
+        skip = context_frames * UPSAMPLE
+        new_pcm = wav[skip:]
+        self._emitted_frames = len(self._buf)
+        return _to_int16_bytes(new_pcm)
+
+    def flush(self) -> Optional[bytes]:
+        if len(self._buf) <= self._emitted_frames:
+            return None
+        start = max(0, len(self._buf) - self._window)
+        window_frames = torch.stack(self._buf[start:], dim=0).to(self._device)
+        wav = self._decode(window_frames)
+        new_frames = len(self._buf) - self._emitted_frames
+        window_len = len(self._buf) - start
+        context_frames = window_len - new_frames
+        skip = context_frames * UPSAMPLE
+        self._emitted_frames = len(self._buf)
+        return _to_int16_bytes(wav[skip:])
+
+
+def _to_int16_bytes(wav) -> bytes:
+    import numpy as np
+    arr = wav.numpy() if isinstance(wav, torch.Tensor) else np.asarray(wav)
+    arr = np.clip(arr, -1.0, 1.0)
+    return (arr * 32767.0).astype(np.int16).tobytes()

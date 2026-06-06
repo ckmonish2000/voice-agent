@@ -1,0 +1,15 @@
+# Secrets — never commit real keys
+.env
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+
+# Node / frontend
+frontend/node_modules/
+frontend/dist/
+
+# OS / editor
+.DS_Store
