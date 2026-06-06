@@ -123,6 +123,13 @@ There are two ways to test, both served by the Pipecat server:
 - After restarting the Pipecat server, **close the browser tab and open a fresh
   one** before reconnecting, or you may see "Peer connection not found".
 
+## Docs
+
+- `docs/2026-06-05-voice-agent-frontend-design.md` — how the three apps fit together (beginner-friendly).
+- `docs/2026-06-05-voice-agent-debugging-log.md` — every bug hit during bring-up and how it was fixed.
+- `docs/2026-06-06-megakernel-roadmap.md` — why audio is slow on this hardware and the planned GPU fast path.
+- `docs/2026-06-06-megakernel-vast-setup.md` — step-by-step Vast.ai runbook to build/test the megakernel on a rented RTX 5090.
+
 ## Tests
 
 ```bash
