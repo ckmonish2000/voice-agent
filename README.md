@@ -42,16 +42,34 @@ voice-agent/
 
 ## One-time setup
 
+### 1. Python environment + dependencies
+
+Use **uv** (recommended — much faster) or plain pip. Pick one.
+
+**Option A — uv (recommended):**
 ```bash
-# 1. Python environment + dependencies
+uv venv --python 3.14                 # create .venv with Python 3.14
+uv pip install -r requirements.txt    # install all Python deps
+```
+If Python 3.14 isn't found, uv offers to download it; or drop `--python 3.14`
+to use your default, or pick another like `--python 3.13`.
+
+**Option B — pip + venv:**
+```bash
 python -m venv .venv
 .venv/bin/pip install -r requirements.txt
+```
 
-# 2. Secrets: copy the example and fill in your two keys
+### 2. Secrets
+
+```bash
 cp .env.example .env
 #    then edit .env and set DEEPGRAM_API_KEY and OPENAI_API_KEY
+```
 
-# 3. Frontend dependencies
+### 3. Frontend dependencies
+
+```bash
 cd frontend
 npm install
 cd ..
@@ -60,6 +78,10 @@ cd ..
 ## Running it (three processes, three terminals)
 
 Start them in this order. Keep each terminal open.
+
+> The Python commands below use `.venv/bin/python`. If you set up with uv, you
+> can instead prefix with `uv run` (e.g. `uv run uvicorn ...`, `uv run python
+> ...`) and uv will use the venv automatically — no activation needed.
 
 **Terminal 1 — inference server (the voice model), port 8000:**
 ```bash
@@ -112,10 +134,14 @@ There are two ways to test, both served by the Pipecat server:
 
 | What | Command |
 |------|---------|
-| Setup Python | `python -m venv .venv && .venv/bin/pip install -r requirements.txt` |
+| Setup Python (uv) | `uv venv --python 3.14 && uv pip install -r requirements.txt` |
+| Setup Python (pip) | `python -m venv .venv && .venv/bin/pip install -r requirements.txt` |
 | Setup secrets | `cp .env.example .env` then edit `.env` |
 | Setup frontend | `cd frontend && npm install` |
-| Run inference server | `.venv/bin/python -m uvicorn inference_server.app:app --port 8000` |
-| Run Pipecat server | `.venv/bin/python pipecat_server/server.py -t webrtc` |
+| Run inference server | `uv run uvicorn inference_server.app:app --port 8000` |
+| Run Pipecat server | `uv run python pipecat_server/server.py -t webrtc` |
 | Run frontend | `cd frontend && npm run dev` |
+| Run tests | `uv run pytest pipecat_server/` |
 | Open the app | http://localhost:5173 |
+
+(For pip-based setup, replace `uv run` with `.venv/bin/python -m` / `.venv/bin/python`.)
