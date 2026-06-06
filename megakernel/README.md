@@ -1,10 +1,12 @@
 # Megakernel Port — Verified Findings & Index
 
-**Date:** 2026-06-07 · **Status:** **Phase 4a body parity PASSED** on a real RTX 5090.
-Box verified, unchanged kernel builds + runs, GO/NO-GO cleared (GO), talker weights
-captured, MRoPE shown to collapse to plain 1D, and the ported kernel body reproduces the
-stock-PyTorch talker layer to within bf16 noise (max abs diff 0.0078). Next: fix the
-output stage vocab (3072) + the 16-code path (Phase 4b).
+**Date:** 2026-06-07 · **Status:** **Phase 4a + 4b(code0) PASSED** on a real RTX 5090.
+Box verified, kernel builds + runs, GO/NO-GO cleared (GO), talker weights captured, MRoPE
+shown to collapse to plain 1D. The ported kernel body matches stock PyTorch to bf16 noise
+(4a, max abs diff 0.0078), AND the full 28-layer decode + output stage (vocab 3072 +
+`codec_head` + argmax) produces the **exact same codebook-0 token** as PyTorch (4b: both
+code0 = 1497, decisive logit margin). **The kernel can now generate a real talker code.**
+Next: codes 1–15 via the PyTorch `code_predictor`, then full 16-code frame parity (4b cont.).
 
 This folder groups everything about porting the `AlpinDale/qwen_megakernel` CUDA kernel
 to drive the **Qwen3-TTS talker**: the vendored kernel source, the port, the tests, the
@@ -299,6 +301,30 @@ Both fixes came from **localizing before changing** — read what the kernel act
 (the vocab constant; the `cache_len = position+1` line), form a hypothesis that explains the
 *specific* symptom, then make the smallest change that tests it. We never edited the `.cu`
 blindly.
+
+---
+
+## 6c. Phase 4b code0 RESULT — PASSED ✅
+
+After making `LDG_VOCAB_SIZE` a build flag and recompiling with `=3072`, the kernel's full
+28-layer decode + output stage (final norm → `codec_head` → argmax) was compared to stock
+PyTorch (`parity_code0.py`, single token, position 0):
+
+```
+token=100  position=0
+PyTorch code0 = 1497
+Kernel  code0 = 1497          <- exact match
+PyTorch top-5 logits: [(1497, 9.188), (1238, 8.5), (763, 8.25), (628, 8.188), (1185, 7.938)]
+PASS — kernel output stage produces the correct codebook-0 token.
+```
+The top logit (9.188) beats the runner-up (8.5) by a clear margin — a decisive argmax, not a
+bf16 tie. **The kernel emits a correct codebook-0 token for the talker.** The vocab build
+flag (text 151936 ↔ talker 3072) works; recompile is triggered automatically by the changed
+`-DLDG_VOCAB_SIZE` flag.
+
+**Still in PyTorch (by design):** codes 1–15 come from the separate 5-layer `code_predictor`
+(`talker.code_predictor`, per-code vocab 2048). Plan: kernel emits the talker hidden state +
+code0; PyTorch runs the 15-code loop. Next milestone: full 16-code frame parity.
 
 ---
 
