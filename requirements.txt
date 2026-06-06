@@ -3,6 +3,10 @@
 # Versions below match what this project was developed and tested against.
 
 # --- Inference server (Qwen3-TTS model) ---
+# qwen-tts is the model package the engine/loader import (`from qwen_tts import
+# Qwen3TTSModel`). It brings its own deps: accelerate, einops, librosa,
+# torchaudio, transformers, soundfile, onnxruntime, sox, gradio.
+qwen-tts==0.1.1
 torch==2.12.0
 transformers==4.57.3
 numpy==2.4.6

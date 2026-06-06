@@ -48,6 +48,10 @@ def build_pipeline_task(transport) -> PipelineTask:
     tts = QwenWSTTSService(
         uri=os.environ.get("QWEN_TTS_URI", "ws://localhost:8000/tts"),
         sample_rate=SR,
+        # Jitter-buffer pre-roll (seconds) before playback starts. Tune via env:
+        # smaller = lower latency but riskier underrun; larger = smoother but more
+        # initial delay. Default 2.5s suits short replies on the slow MPS model.
+        preroll_secs=float(os.environ.get("QWEN_TTS_PREROLL", "2.5")),
     )
 
     context = LLMContext(messages=[{"role": "system", "content": SYSTEM_PROMPT}])

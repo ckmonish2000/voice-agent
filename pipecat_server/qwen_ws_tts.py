@@ -31,7 +31,7 @@ class QwenWSTTSService(TTSService):
     """Streams audio from the Qwen3-TTS WebSocket inference server."""
 
     def __init__(self, *, uri: str = "ws://localhost:8000/tts",
-                 sample_rate: int = 24000, **kwargs):
+                 sample_rate: int = 24000, preroll_secs: float = 2.5, **kwargs):
         # The voice is fixed server-side (the reference-clone clip), so model/
         # voice/language have no per-request meaning here; set them to None to
         # satisfy TTSSettings validation.
@@ -44,6 +44,10 @@ class QwenWSTTSService(TTSService):
         )
         self._uri = uri
         self._sample_rate = sample_rate
+        # Jitter buffer pre-roll: how many seconds of audio to accumulate before
+        # we start playback. Bigger = smoother but more initial delay. Converted
+        # to bytes: sample_rate * 2 bytes/sample (int16) * 1 channel.
+        self._preroll_bytes = int(preroll_secs * sample_rate * 2)
 
     def can_generate_metrics(self) -> bool:
         return True
@@ -55,17 +59,24 @@ class QwenWSTTSService(TTSService):
             await self.start_ttfb_metrics()
             yield TTSStartedFrame(context_id=context_id)
 
+            # JITTER BUFFER (pre-roll cushion).
             # The Qwen model decodes ~12x slower than real time on Apple Silicon
-            # (MPS): RTF ~11-13 per the project README. A real-time transport like
-            # WebRTC drains its output buffer faster than the model can fill it, so
-            # streaming each chunk as it arrives underruns and the voice breaks up
-            # ("i a m do ing we ll"). Instead we buffer the WHOLE utterance, then
-            # emit it as one frame: the output transport re-chunks it into a steady
-            # 10ms cadence with no underrun, so playback is gapless. The cost is
-            # latency — the listener waits for the full decode before any sound.
-            # When the fast GPU kernel lands (RTF < 0.1), switch back to streaming
-            # each chunk for low-latency output.
-            pcm = bytearray()
+            # (MPS): RTF ~11-13. WebRTC plays at 1x real time, so if we stream each
+            # chunk the instant it arrives, the output buffer empties faster than
+            # the model can refill it and the voice breaks up ("i a m do ing we ll").
+            #
+            # Instead we accumulate a cushion of `_preroll_bytes` (default ~2.5s of
+            # audio) BEFORE emitting anything. Once the cushion is ready we release
+            # it as one frame (playback starts), then stream every later chunk as it
+            # arrives. While the cushion plays, the model keeps generating, so for
+            # short replies (a sentence or two) playback usually finishes the cushion
+            # right as the rest arrives — smooth, with less initial delay than
+            # buffering the entire reply. For long replies the cushion can still run
+            # dry (the model is simply too slow), so this trades some smoothness on
+            # long replies for lower latency. Tune with preroll_secs / QWEN_TTS_PREROLL.
+            # When the fast GPU kernel lands (RTF < 0.1), set preroll to ~0.
+            buf = bytearray()
+            started = False  # have we released the pre-roll cushion yet?
             async with websockets.connect(self._uri, max_size=None) as ws:
                 await ws.send(json.dumps({"text": text}))
                 first = True
@@ -75,7 +86,27 @@ class QwenWSTTSService(TTSService):
                         if first:
                             await self.stop_ttfb_metrics()
                             first = False
-                        pcm.extend(msg)
+                        buf.extend(msg)
+                        # Hold until the cushion is full; after that, stream each
+                        # chunk through immediately.
+                        if not started:
+                            if len(buf) >= self._preroll_bytes:
+                                yield TTSAudioRawFrame(
+                                    audio=bytes(buf),
+                                    sample_rate=self._sample_rate,
+                                    num_channels=1,
+                                    context_id=context_id,
+                                )
+                                buf.clear()
+                                started = True
+                        else:
+                            yield TTSAudioRawFrame(
+                                audio=bytes(buf),
+                                sample_rate=self._sample_rate,
+                                num_channels=1,
+                                context_id=context_id,
+                            )
+                            buf.clear()
                     else:
                         evt = json.loads(msg)
                         if evt.get("event") == "done":
@@ -85,9 +116,11 @@ class QwenWSTTSService(TTSService):
                             yield ErrorFrame(f"server error: {evt.get('message')}")
                             break
 
-            if pcm:
+            # Flush whatever is left (the reply ended before the cushion filled, or
+            # a final partial chunk after streaming started).
+            if buf:
                 yield TTSAudioRawFrame(
-                    audio=bytes(pcm),
+                    audio=bytes(buf),
                     sample_rate=self._sample_rate,
                     num_channels=1,
                     context_id=context_id,
