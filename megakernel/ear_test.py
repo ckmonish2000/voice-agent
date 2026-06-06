@@ -82,21 +82,31 @@ def main():
     print("audibly safe (this perturbation is RANDOM = worse than the kernel's near-misses).")
 
 
-def _extract_codes(result):
-    """Pull a (T,16) LongTensor out of whatever generate_voice_clone returned."""
+def _extract_codes(result, num_groups=16):
+    """Pull a (T,16) LongTensor out of whatever generate_voice_clone returned.
+
+    Handles: tuple/list wrapping, (T,16), (16,T), and FLAT (T*16,) — the version
+    on this box returns a flat 1-D tensor (e.g. 65280 = 4080 frames x 16)."""
     import torch
-    if isinstance(result, tuple):
-        result = result[0]
-    if isinstance(result, list):
+    while isinstance(result, (tuple, list)):
         result = result[0]
     t = result if isinstance(result, torch.Tensor) else torch.as_tensor(result)
     t = t.squeeze()
-    if t.dim() != 2:
-        raise SystemExit(f"unexpected codes shape {tuple(t.shape)}; inspect generate output")
-    # ensure (T,16)
-    if t.shape[0] == 16 and t.shape[1] != 16:
-        t = t.t()
-    return t.long()
+
+    if t.dim() == 1:
+        n = t.numel()
+        if n % num_groups != 0:
+            raise SystemExit(
+                f"flat codes length {n} not divisible by {num_groups}; inspect output"
+            )
+        # frames are interleaved as [c0..c15, c0..c15, ...] -> (T, 16)
+        t = t.view(-1, num_groups)
+    elif t.dim() == 2:
+        if t.shape[0] == num_groups and t.shape[1] != num_groups:
+            t = t.t()  # (16,T) -> (T,16)
+    else:
+        raise SystemExit(f"unexpected codes shape {tuple(t.shape)}; inspect output")
+    return t.long().contiguous()
 
 
 def _decode(tok, codes):
