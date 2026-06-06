@@ -93,8 +93,13 @@ def main():
     )
     torch.cuda.synchronize()
     kernel_code0 = int(dec._out_token.item())
-    # _norm_out (g_normalized) = post-final-norm hidden the LM head consumed.
-    kernel_hidden = dec._norm_out.detach().to(torch.bfloat16).view(1, 1, -1)
+    # diag_hidden.py showed dec._norm_out does NOT equal PyTorch's post-norm
+    # last_hidden_state (diff 1.37), but dec._hidden (pre-norm) matches PyTorch's
+    # pre-norm hidden closely (diff 0.19, accumulated bf16 drift over 28 layers).
+    # The predictor wants the POST-norm hidden, so take the kernel's pre-norm
+    # _hidden and apply PyTorch's own final norm to it (identical norm op).
+    kernel_prenorm = dec._hidden.detach().to(torch.bfloat16).view(1, 1, -1)
+    kernel_hidden = talker_model.norm(kernel_prenorm)   # post-norm, via PyTorch
     kernel_rest = run_predictor(kernel_hidden, kernel_code0)
     kernel_frame = [kernel_code0] + kernel_rest
 
