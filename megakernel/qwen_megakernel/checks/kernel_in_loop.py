@@ -71,10 +71,18 @@ def main():
 
     st = {"seeded": False, "emb": None, "pos": None, "steps": 0, "maxdiff": 0.0}
 
+    def _layer_kv(pkv, L):
+        """Return (keys, values) for layer L across transformers cache APIs.
+        5.x: pkv.layers[L].keys/.values ; older: pkv.key_cache[L]/value_cache[L]."""
+        if hasattr(pkv, "layers"):
+            layer = pkv.layers[L]
+            return layer.keys, layer.values
+        return pkv.key_cache[L], pkv.value_cache[L]
+
     def seed_cache(pkv, upto):
         kc, vc = dec._k_cache, dec._v_cache       # (L,8,MAX,128)
         for L in range(kc.shape[0]):
-            k = pkv.key_cache[L]; v = pkv.value_cache[L]   # (1,8,seq,128)
+            k, v = _layer_kv(pkv, L)              # (1,8,seq,128)
             n = min(k.shape[2], kc.shape[2])
             kc[L, :, :n, :] = k[0, :, :n, :].to(kc.dtype)
             vc[L, :, :n, :] = v[0, :, :n, :].to(vc.dtype)
