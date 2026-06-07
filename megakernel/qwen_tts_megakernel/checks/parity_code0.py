@@ -28,7 +28,7 @@ POS = 0
 
 def main():
     import sys
-    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
     # Safety: warn loudly if the env flag wasn't set (kernel would be vocab 151936
     # and read OOB on the 3072-row codec_head -> illegal memory access).
@@ -41,7 +41,7 @@ def main():
             "Re-run as:  LDG_VOCAB_SIZE=3072 python parity_code0.py\n"
         )
 
-    from model_tts import build_talker_decoder
+    from qwen_tts_megakernel.model_tts import build_talker_decoder
 
     dec, model = build_talker_decoder(verbose=True)
     talker_model = model.talker.model
@@ -69,7 +69,7 @@ def main():
     # ---------- Kernel: full decode (28 layers) -> argmax code0 ----------
     dec.reset()
     dec._position = POS
-    _decode = torch.ops.qwen_megakernel_C.decode
+    _decode = torch.ops.qwen_tts_megakernel_C.decode
     _decode(
         dec._out_token, TOK,
         dec._embed_weight, dec._layer_weights_packed,

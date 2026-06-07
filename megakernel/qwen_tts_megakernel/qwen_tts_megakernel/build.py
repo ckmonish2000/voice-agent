@@ -47,13 +47,13 @@ CUDA_FLAGS = [
 
 
 def get_extension():
-    """Build (or return cached) the megakernel extension. Triggers torch.ops.qwen_megakernel_C.*"""
+    """Build (or return cached) the megakernel extension. Triggers torch.ops.qwen_tts_megakernel_C.*"""
     global _module
     if _module is not None:
         return _module
 
     _module = load(
-        name="qwen_megakernel_C",
+        name="qwen_tts_megakernel_C",
         sources=[
             os.path.join(_CSRC, "torch_bindings.cpp"),
             os.path.join(_CSRC, "kernel.cu"),

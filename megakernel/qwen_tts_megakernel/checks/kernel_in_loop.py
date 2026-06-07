@@ -28,7 +28,7 @@ import os
 import sys
 import torch
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 TEXT = sys.argv[1] if len(sys.argv) > 1 else "Hello there, this is the kernel."
 VERIFY = os.environ.get("VERIFY", "1") == "1"
@@ -49,7 +49,7 @@ def main():
     import numpy as np
     import soundfile as sf
     from qwen_tts import Qwen3TTSModel
-    from model_tts import build_talker_decoder
+    from qwen_tts_megakernel.model_tts import build_talker_decoder
 
     print(f"[4c] loading; text={TEXT!r}  VERIFY={VERIFY}")
     # Kernel decoder (talker weights packed for the kernel).
@@ -63,7 +63,7 @@ def main():
     model = tts.model
     talker_model = model.talker.model
     tok = model.speech_tokenizer
-    _dfh = torch.ops.qwen_megakernel_C.decode_from_hidden
+    _dfh = torch.ops.qwen_tts_megakernel_C.decode_from_hidden
 
     prompt_items = tts.create_voice_clone_prompt(
         ref_audio=REF_AUDIO, ref_text=REF_TEXT, x_vector_only_mode=False)

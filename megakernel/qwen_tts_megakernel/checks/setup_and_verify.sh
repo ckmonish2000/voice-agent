@@ -6,14 +6,13 @@
 #   2. verifies the box: RTX 5090, nvcc >= 12.8, torch sees CUDA
 #   3. runs the parity suite (4a body, 4b code0, 4b 16-code frame)
 #
-# Run from this directory (voice-agent/megakernel/qwen_megakernel/checks):
+# Run from this directory (voice-agent/megakernel/qwen_tts_megakernel/checks):
 #   bash setup_and_verify.sh
 #
 # Safe to re-run. Stops at the first hard failure (box not a 5090 / no nvcc).
 
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-KERNEL_DIR="$(dirname "$HERE")"   # the qwen_megakernel/ dir (for -m bench)
 cd "$HERE"
 
 bold() { printf "\n\033[1m== %s ==\033[0m\n" "$1"; }
@@ -43,14 +42,11 @@ assert "5090" in name, f"torch device is {name}, not a 5090"
 print(f"  OK  torch {torch.__version__}, cuda {torch.version.cuda}, dev {name}")
 PY
 
-bold "3/4  Build sanity (upstream bench — JIT-compiles the kernel)"
-( cd "$KERNEL_DIR" && python -m qwen_megakernel.bench ) \
-  && ok "kernel compiles + runs" \
-  || echo "  (bench had issues — note the upstream text-correctness caveat in README; build is what matters)"
+bold "3/4  Build + body parity (parity_single JIT-compiles the kernel)"
+python parity_single.py || die "parity_single failed (build or parity)"
+ok "kernel compiles + Phase 4a body parity passes"
 
-bold "4/4  Parity suite"
-echo "--- Phase 4a: single-layer body parity ---"
-python parity_single.py || die "parity_single failed"
+bold "4/4  Output-stage parity suite"
 echo "--- Phase 4b: code0 parity (vocab 3072, recompiles) ---"
 LDG_VOCAB_SIZE=3072 python parity_code0.py || die "parity_code0 failed"
 echo "--- Phase 4b: full 16-code frame parity ---"

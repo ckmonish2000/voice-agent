@@ -17,7 +17,7 @@ Setup (empty KV cache, one token, one layer):
 Pass: max abs diff within bf16 tolerance (~2e-2). That means the body port is
 faithful and the size-match holds in practice.
 
-Run ON THE BOX from the kernel repo dir (so `qwen_megakernel` imports), with
+Run ON THE BOX from the kernel repo dir (so `qwen_tts_megakernel` imports), with
 model_tts.py on the path:
     python parity_single.py
 """
@@ -36,9 +36,9 @@ LAYER_IDX = 0
 
 def main():
     import sys, os
-    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-    from model_tts import build_talker_decoder, HEAD_DIM
+    from qwen_tts_megakernel.model_tts import build_talker_decoder, HEAD_DIM
 
     # Build kernel decoder (talker weights) + keep the full PyTorch model.
     dec, model = build_talker_decoder(verbose=True)
@@ -80,7 +80,7 @@ def main():
     dec._position = POS
     # run a single decode step with num_layers=1 by calling the op directly with
     # the decoder's buffers but overriding num_layers.
-    _decode = torch.ops.qwen_megakernel_C.decode
+    _decode = torch.ops.qwen_tts_megakernel_C.decode
     _decode(
         dec._out_token,
         TOK,

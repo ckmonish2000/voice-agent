@@ -7,7 +7,7 @@ weight loader + a Decoder built from those weights, reusing the kernel's existin
 vocab, and the untied output head change).
 
 Drop this file next to the cloned kernel repo on the box so it can
-`from qwen_megakernel.model import Decoder, _pack_layer_weights, ...`.
+`from qwen_tts_megakernel.model import Decoder, _pack_layer_weights, ...`.
 
 Verified facts this port relies on (see megakernel/README.md):
   - talker dims == kernel dims (28 / 1024 / 3072 / 16 / 8 / 128 / eps 1e-6)  [GO]
@@ -113,20 +113,9 @@ def load_talker_weights(model_name: str = MODEL_ID, verbose: bool = True):
 def build_talker_decoder(verbose: bool = True):
     """Build a kernel Decoder wired to the talker weights, reusing the kernel's
     Decoder machinery unchanged. Returns (decoder, full_model)."""
-    # Make `import qwen_megakernel` resolve. These scripts live in
-    # megakernel/qwen_megakernel/checks/, so the kernel package is one level up
-    # (the parent dir). We also check a couple of fallbacks for robustness.
-    import os, sys
-    here = os.path.dirname(os.path.abspath(__file__))
-    parent = os.path.dirname(here)
-    candidates = (parent, os.path.join(here, "qwen_megakernel"), here)
-    for cand in candidates:
-        if os.path.isdir(os.path.join(cand, "qwen_megakernel")):
-            if cand not in sys.path:
-                sys.path.insert(0, cand)
-            break
-
-    from qwen_megakernel.model import Decoder
+    # model_tts.py lives INSIDE the qwen_tts_megakernel package, so the kernel
+    # Decoder is a sibling module.
+    from qwen_tts_megakernel.model import Decoder
 
     weights, model = load_talker_weights(verbose=verbose)
     # Decoder(weights=...) skips its own loader and uses ours. tokenizer not

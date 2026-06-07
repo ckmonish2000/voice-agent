@@ -21,52 +21,56 @@ real generation loop and produces correct speech:
 way to end-to-end spoken audio. Remaining work is optional productionization (speed tuning;
 wiring into the Pipecat voice agent in `inference_server/`).
 
-This folder groups everything about porting the `AlpinDale/qwen_megakernel` CUDA kernel
-to drive the **Qwen3-TTS talker**: the vendored kernel source, the port, the tests, the
-runbook, and the verified results. The kernel source is vendored under
-`qwen_megakernel/` so the **whole thing clones to the box in one go** — no separate repo.
+This is **`qwen_tts_megakernel`** — the `AlpinDale/qwen_megakernel` CUDA kernel ported to drive
+the **Qwen3-TTS talker**. It's one self-contained package (kernel + port + tests + docs) that
+clones to the box in one go. The original text-only kernel is not kept separately; its files
+live here, edited for TTS (vocab build flag + `decode_from_hidden` op).
 
 ## Folder layout
 
-The vendored kernel lives in `megakernel/qwen_megakernel/`; all our run scripts are grouped
-in `megakernel/qwen_megakernel/checks/` (they add the parent dir to `sys.path`, so
-`import qwen_megakernel` resolves with **zero copying**) — clone, `cd checks`, run.
+Mirrors the upstream `qwen_megakernel` layout (`csrc/` + inner package), with the TTS port
+(`model_tts.py`) inside the package and all run scripts under `checks/`.
 
 ```
 megakernel/
-├── README.md                       ← this file: verified results + index + recipe
+├── README.md                       ← this file: verified results + usage
 ├── docs/
 │   ├── 2026-06-06-megakernel-roadmap.md     ← why the fast path exists (context)
 │   └── 2026-06-06-megakernel-vast-setup.md  ← step-by-step Vast.ai runbook
-└── qwen_megakernel/                ← VENDORED kernel (AlpinDale + our LDG_VOCAB_SIZE flag)
-    ├── csrc/kernel.cu                  (LDG_VOCAB_SIZE = build-overridable macro)
-    ├── qwen_megakernel/                (model.py, build.py, bench.py — kernel Python side)
-    ├── requirements.txt, LICENSE
-    └── checks/                     ← ALL our scripts (run from here)
-        ├── model_tts.py                THE PORT: talker weights (theta, vocab, untied head)
-        ├── parity_single.py            Phase 4a: single-layer parity (PASSED, diff 0.0078)
-        ├── parity_code0.py             Phase 4b: full-decode codebook-0 parity (PASSED)
-        ├── parity_frame16.py           Phase 4b: full 16-code frame parity (13/16)
-        ├── diag_hidden.py              diagnostic: which kernel buffer == PyTorch hidden
-        ├── ear_test.py                 codec ear-test: is tail-code drift audible?
-        ├── check_cfg.py                GO/NO-GO talker config check
-        ├── dump_weights.py             dump talker weight names + shapes
-        ├── check_positions.py          prove MRoPE collapses to plain 1D
-        └── capture_reference.py        save stock-PyTorch hidden states (ground truth)
+└── qwen_tts_megakernel/            ← THE package (clone target)
+    ├── csrc/
+    │   ├── kernel.cu                   fused 28-layer kernel (LDG_VOCAB_SIZE flag + decode_from_hidden)
+    │   └── torch_bindings.cpp          torch ops: decode, decode_from_hidden, generate_nosync
+    ├── qwen_tts_megakernel/         ← the importable Python package
+    │   ├── __init__.py
+    │   ├── build.py                    JIT compile flags (-arch=sm_120a, LDG_VOCAB_SIZE)
+    │   ├── model.py                    kernel Decoder + KV cache + buffers
+    │   └── model_tts.py                THE PORT: load talker weights (theta=1e6, vocab 3072, untied head)
+    ├── checks/                      ← all run scripts (run from here)
+    │   ├── setup_and_verify.sh         one-shot: deps + box check + parity suite
+    │   ├── check_cfg.py                GO/NO-GO talker config
+    │   ├── dump_weights.py             talker weight names + shapes
+    │   ├── check_positions.py          MRoPE collapses to plain 1D
+    │   ├── capture_reference.py        save PyTorch hidden states (ground truth)
+    │   ├── parity_single.py            4a: single-layer parity (PASS, 0.0078)
+    │   ├── parity_code0.py             4b: full-decode code0 parity (PASS, exact)
+    │   ├── parity_frame16.py           4b: full 16-code frame (13/16)
+    │   ├── test_decode_from_hidden.py  4c: decode_from_hidden == decode (bit-exact)
+    │   ├── kernel_in_loop.py           4c: kernel drives the real loop -> kernel_out.wav
+    │   ├── diag_hidden.py              diagnostic: which buffer == PyTorch hidden
+    │   └── ear_test.py                 is the tail-code drift audible? (no)
+    ├── LICENSE                       (upstream Apache-2.0, preserved)
+    └── requirements.txt              torch, transformers, ninja, qwen-tts, soundfile, ...
 ```
 
+### The files that matter most
 | File | What it is |
 |------|------------|
-| `qwen_megakernel/` (package) | Vendored CUDA kernel (upstream + our `LDG_VOCAB_SIZE` build flag). JIT-compiles `csrc/kernel.cu` on first run. |
-| `model_tts.py` | **The port.** Talker weights into kernel format (theta=1e6, vocab 3072, untied `codec_head`). Reuses the kernel `Decoder` unchanged. |
-| `parity_single.py` | **Phase 4a (PASSED).** One token, one layer, kernel vs PyTorch hidden (diff 0.0078). |
-| `parity_code0.py` | **Phase 4b (PASSED).** Full 28-layer decode → codebook-0 token, kernel vs PyTorch (exact). Needs `LDG_VOCAB_SIZE=3072`. |
-| `parity_frame16.py` | **Phase 4b.** Full 16-code frame (kernel hidden + code0 → PyTorch predictor for 1–15). 13/16, first 12 exact (bf16 floor). |
-| `diag_hidden.py` | Diagnostic: compares kernel buffers vs PyTorch pre/post-norm hidden. |
-| `ear_test.py` | Codec ear-test: perturb tail codebooks, decode two wavs, listen — is the drift audible? |
-| `setup_and_verify.sh` | **One-shot box setup.** Installs deps, verifies RTX 5090 + nvcc ≥ 12.8 + torch/CUDA, builds the kernel, runs the parity suite. Run this first on a fresh box. |
-| `check_cfg.py` / `dump_weights.py` / `check_positions.py` / `capture_reference.py` | Step-0 helpers (config, weight names, MRoPE check, ground-truth capture). |
-| `docs/…` | Roadmap + Vast.ai runbook. |
+| `qwen_tts_megakernel/model_tts.py` | **The port.** Talker weights into kernel format. Start here. |
+| `csrc/kernel.cu` | The CUDA kernel + our edits (`LDG_VOCAB_SIZE` flag, `decode_from_hidden`). |
+| `checks/kernel_in_loop.py` | **The payoff.** Kernel drives a full utterance → `kernel_out.wav`. |
+| `csrc/torch_bindings.cpp` | Exposes `decode` / `decode_from_hidden` to Python. |
+| `qwen_tts_megakernel/model.py` / `build.py` | Kernel `Decoder` + JIT build flags. |
 
 ## Running on the box
 
@@ -78,45 +82,50 @@ Disk ≥ 40 GB. See `docs/2026-06-06-megakernel-vast-setup.md` for the full rent
 ### Fastest path — one script (recommended)
 ```bash
 git clone https://github.com/ckmonish2000/voice-agent.git
-cd voice-agent/megakernel/qwen_megakernel/checks
+cd voice-agent/megakernel/qwen_tts_megakernel/checks
 bash setup_and_verify.sh
 ```
 `setup_and_verify.sh` installs deps, **verifies the box** (RTX 5090 + nvcc ≥ 12.8 + torch sees
-CUDA), JIT-builds the kernel, and runs the full parity suite (4a, 4b code0, 4b frame). It stops
-with a clear error if the box is wrong (not a 5090 / no nvcc / CUDA too old).
+CUDA), JIT-builds the kernel via `parity_single`, then runs the output-stage parity suite. It
+stops with a clear error if the box is wrong (not a 5090 / no nvcc / CUDA too old).
 
 ### Manual path (same steps, run individually)
 ```bash
 git clone https://github.com/ckmonish2000/voice-agent.git
-cd voice-agent/megakernel/qwen_megakernel/checks
-pip install qwen-tts ninja soundfile          # qwen-tts NOT in upstream reqs — required here
+cd voice-agent/megakernel/qwen_tts_megakernel/checks
+pip install qwen-tts ninja soundfile           # or: pip install -r ../requirements.txt
 
-# --- verify the box works (do this first on any new box) ---
-nvidia-smi | grep 5090                         # must show RTX 5090
-nvcc --version                                 # must be release >= 12.8
+# --- verify the box (do this first on any new box) ---
+nvidia-smi | grep 5090                          # must show RTX 5090
+nvcc --version                                  # must be release >= 12.8
 python -c "import torch; print(torch.__version__, torch.version.cuda, torch.cuda.is_available(), torch.cuda.get_device_name(0))"
 # expect: ... True NVIDIA GeForce RTX 5090
 
-# --- build sanity (upstream bench; run from the kernel dir, -m needs the package) ---
-( cd .. && python -m qwen_megakernel.bench )   # ~1000 tok/s
+# --- parity suite (run from checks/; first run JIT-compiles the kernel) ---
+python parity_single.py                         # 4a body parity        -> PASS (0.0078)
+LDG_VOCAB_SIZE=3072 python parity_code0.py      # 4b code0 parity        -> PASS (recompiles)
+LDG_VOCAB_SIZE=3072 python parity_frame16.py    # 4b full 16-code frame  -> 13/16
+LDG_VOCAB_SIZE=3072 python test_decode_from_hidden.py   # 4c op check     -> PASS (bit-exact)
 
-# --- parity suite (run from checks/) ---
-python parity_single.py                        # 4a body parity        -> PASS (0.0078)
-LDG_VOCAB_SIZE=3072 python parity_code0.py     # 4b code0 parity        -> PASS (recompiles)
-LDG_VOCAB_SIZE=3072 python parity_frame16.py   # 4b full 16-code frame  -> 13/16
+# --- end-to-end kernel-driven audio (Phase 4c) ---
+LDG_VOCAB_SIZE=3072 VERIFY=1 python kernel_in_loop.py "Hi."   # per-step hidden parity (slow)
+LDG_VOCAB_SIZE=3072 VERIFY=0 python kernel_in_loop.py "Hi."   # renders kernel_out.wav
 
-# --- ear test (does the tail-code drift sound different?) ---
+# --- ear test (is the tail-code drift audible? no) ---
 python ear_test.py "Hello, this is a test of the speech kernel."
 # -> writes ear_ref.wav and ear_drift.wav; download + compare by ear
 ```
 
-> **`LDG_VOCAB_SIZE=3072` is required** for `parity_code0`/`parity_frame16` — without it the
-> kernel compiles for vocab 151936 and reads past the 3072-row `codec_head` (illegal memory
+> **`LDG_VOCAB_SIZE=3072` is required** for everything that uses the output stage
+> (`parity_code0`, `parity_frame16`, `test_decode_from_hidden`, `kernel_in_loop`) — without it
+> the kernel compiles for vocab 151936 and reads past the 3072-row `codec_head` (illegal memory
 > access). The JIT recompiles automatically when the flag changes.
 
-> `python -m qwen_megakernel.bench` runs from the **kernel dir** (`cd ..`), since `-m` needs
-> `qwen_megakernel` as a top-level package. Our `checks/` scripts add the parent to `sys.path`
-> themselves, so they run from `checks/` directly.
+> The scripts in `checks/` add the package dir to `sys.path` and import
+> `qwen_tts_megakernel.*`, so they run directly from `checks/` — no copying.
+
+> `kernel_in_loop.py` is **slow in VERIFY=1** (runs PyTorch *and* the kernel each step); it
+> prints per-step progress so you can see it advance. Use a short input first.
 
 ---
 
@@ -134,7 +143,10 @@ CUDA 13 supports `sm_120a` (Blackwell) — the kernel's hardcoded arch.
 
 ---
 
-## 2. Unchanged kernel bench (Phase 1)
+## 2. Unchanged kernel bench (Phase 1) — historical
+
+This was the original Phase-1 step against the **upstream** repo (the text-only `bench.py` is
+not vendored here, since the TTS port doesn't use it). Recorded for provenance:
 
 ```bash
 git clone https://github.com/AlpinDale/qwen_megakernel.git && cd qwen_megakernel
@@ -274,7 +286,10 @@ the `register()` is what matters. The `flash-attn not installed` warning is harm
 
 ## 6. Phase 4a change recipe (grounded — no guessing)
 
-Edits to the kernel's `qwen_megakernel/model.py`:
+These are the changes the port makes vs. the original text kernel. In this repo they live in
+**`qwen_tts_megakernel/model_tts.py`** (a separate loader that reuses the kernel `Decoder`),
+plus the `LDG_VOCAB_SIZE` build flag in `csrc/kernel.cu` — the original `model.py` is kept
+unchanged. Table below maps each change to the original `model.py` line for reference:
 
 | # | Change | Where | From → To |
 |---|--------|-------|-----------|

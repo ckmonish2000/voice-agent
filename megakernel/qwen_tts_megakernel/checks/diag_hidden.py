@@ -18,11 +18,11 @@ POS = 0
 
 def main():
     import sys
-    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     if os.environ.get("LDG_VOCAB_SIZE") != "3072":
         print("WARNING: set LDG_VOCAB_SIZE=3072\n")
 
-    from model_tts import build_talker_decoder
+    from qwen_tts_megakernel.model_tts import build_talker_decoder
     dec, model = build_talker_decoder(verbose=True)
     tm = model.talker.model
 
@@ -40,7 +40,7 @@ def main():
 
     # Kernel
     dec.reset(); dec._position = POS
-    _decode = torch.ops.qwen_megakernel_C.decode
+    _decode = torch.ops.qwen_tts_megakernel_C.decode
     _decode(
         dec._out_token, TOK,
         dec._embed_weight, dec._layer_weights_packed,
