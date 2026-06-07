@@ -29,10 +29,13 @@ ARTIFACTS = os.path.join(os.path.dirname(__file__), "artifacts")
 
 
 def pick_device() -> str:
-    """MPS (Apple GPU) if available, else CPU. Override with QWEN_DEVICE=cpu."""
+    """CUDA (RTX 5090 box) if available, else MPS (Apple GPU), else CPU.
+    Override with QWEN_DEVICE=cuda|mps|cpu."""
     forced = os.environ.get("QWEN_DEVICE")
     if forced:
         return forced
+    if torch.cuda.is_available():
+        return "cuda"
     if torch.backends.mps.is_available():
         return "mps"
     return "cpu"
@@ -42,9 +45,11 @@ def load_model(device: str | None = None):
     """
     Load the full Qwen3-TTS model + processor once.
 
-    We deliberately use the same low-level path the official wrapper uses
-    (AutoModel after registering the custom class), but with Mac-friendly
-    settings: float32 + eager attention, no flash-attn, no device_map="cuda".
+    Uses the low-level path the official wrapper uses (AutoModel after
+    registering the custom class). Dtype is chosen by device:
+      - CUDA  -> bfloat16 (matches the megakernel; required for USE_KERNEL=1)
+      - MPS/CPU -> float32 (the safe choice on Apple Silicon)
+    Eager attention everywhere (no flash-attn dependency).
 
     Returns (model, processor, device).
     """
@@ -57,6 +62,8 @@ def load_model(device: str | None = None):
     )
 
     device = device or pick_device()
+    # bf16 on the GPU (kernel dtype); float32 on MPS/CPU.
+    dtype = torch.bfloat16 if device == "cuda" else torch.float32
 
     # The qwen3_tts architecture is NOT in stock transformers' auto-mapping;
     # the qwen-tts package registers it manually. We do the same here so
@@ -65,11 +72,11 @@ def load_model(device: str | None = None):
     AutoModel.register(Qwen3TTSConfig, Qwen3TTSForConditionalGeneration)
     AutoProcessor.register(Qwen3TTSConfig, Qwen3TTSProcessor)
 
-    print(f"[common] loading {MODEL_ID} on device={device} (float32, eager attn)...")
+    print(f"[common] loading {MODEL_ID} on device={device} ({dtype}, eager attn)...")
     model = AutoModel.from_pretrained(
         MODEL_ID,
-        dtype=torch.float32,              # MPS/CPU: float32 is the safe choice
-        attn_implementation="eager",     # no flash-attn on Apple Silicon
+        dtype=dtype,
+        attn_implementation="eager",     # no flash-attn dependency
     )
     model = model.to(device)
     model.eval()
