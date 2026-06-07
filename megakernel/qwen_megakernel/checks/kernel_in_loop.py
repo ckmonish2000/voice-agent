@@ -127,6 +127,11 @@ def main():
         st["steps"] += 1
         d = (k_hidden.float() - hs.float()).abs().max().item()
         st["maxdiff"] = max(st["maxdiff"], d)
+        # progress: print the first few steps + every 20th, so a slow eager loop
+        # visibly advances instead of sitting silent.
+        if st["steps"] <= 3 or st["steps"] % 20 == 0:
+            print(f"  [step {st['steps']:>4}] pos={pos}  hidden diff={d:.4f}  "
+                  f"running max={st['maxdiff']:.4f}", flush=True)
 
         if not VERIFY:
             output.last_hidden_state = k_hidden  # SUBSTITUTE kernel hidden
