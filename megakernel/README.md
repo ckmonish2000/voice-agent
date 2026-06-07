@@ -15,8 +15,9 @@ runbook, and the verified results. The kernel source is vendored under
 
 ## Folder layout
 
-All runnable scripts live **inside** `megakernel/qwen_megakernel/` (next to the kernel
-package) so they import `qwen_megakernel` with **zero copying** — clone, `cd`, run.
+The vendored kernel lives in `megakernel/qwen_megakernel/`; all our run scripts are grouped
+in `megakernel/qwen_megakernel/checks/` (they add the parent dir to `sys.path`, so
+`import qwen_megakernel` resolves with **zero copying**) — clone, `cd checks`, run.
 
 ```
 megakernel/
@@ -24,22 +25,21 @@ megakernel/
 ├── docs/
 │   ├── 2026-06-06-megakernel-roadmap.md     ← why the fast path exists (context)
 │   └── 2026-06-06-megakernel-vast-setup.md  ← step-by-step Vast.ai runbook
-└── qwen_megakernel/                ← VENDORED kernel + ALL run scripts (one runnable dir)
+└── qwen_megakernel/                ← VENDORED kernel (AlpinDale + our LDG_VOCAB_SIZE flag)
     ├── csrc/kernel.cu                  (LDG_VOCAB_SIZE = build-overridable macro)
     ├── qwen_megakernel/                (model.py, build.py, bench.py — kernel Python side)
     ├── requirements.txt, LICENSE
-    │   --- our port + tests (run from HERE) ---
-    ├── model_tts.py                    THE PORT: talker weights (theta, vocab, untied head)
-    ├── parity_single.py               Phase 4a: single-layer parity (PASSED, diff 0.0078)
-    ├── parity_code0.py                Phase 4b: full-decode codebook-0 parity (PASSED)
-    ├── parity_frame16.py              Phase 4b: full 16-code frame parity (13/16)
-    ├── diag_hidden.py                 diagnostic: which kernel buffer == PyTorch hidden
-    ├── ear_test.py                    codec ear-test: is tail-code drift audible?
-    │   --- standalone helpers (Step 0) ---
-    ├── check_cfg.py                   GO/NO-GO talker config check
-    ├── dump_weights.py                dump talker weight names + shapes
-    ├── check_positions.py             prove MRoPE collapses to plain 1D
-    └── capture_reference.py           save stock-PyTorch hidden states (ground truth)
+    └── checks/                     ← ALL our scripts (run from here)
+        ├── model_tts.py                THE PORT: talker weights (theta, vocab, untied head)
+        ├── parity_single.py            Phase 4a: single-layer parity (PASSED, diff 0.0078)
+        ├── parity_code0.py             Phase 4b: full-decode codebook-0 parity (PASSED)
+        ├── parity_frame16.py           Phase 4b: full 16-code frame parity (13/16)
+        ├── diag_hidden.py              diagnostic: which kernel buffer == PyTorch hidden
+        ├── ear_test.py                 codec ear-test: is tail-code drift audible?
+        ├── check_cfg.py                GO/NO-GO talker config check
+        ├── dump_weights.py             dump talker weight names + shapes
+        ├── check_positions.py          prove MRoPE collapses to plain 1D
+        └── capture_reference.py        save stock-PyTorch hidden states (ground truth)
 ```
 
 | File | What it is |
@@ -58,11 +58,11 @@ megakernel/
 
 ```bash
 git clone https://github.com/ckmonish2000/voice-agent.git
-cd voice-agent/megakernel/qwen_megakernel    # everything runs from here
-pip install qwen-tts                          # TTS model stack (registers qwen3_tts)
+cd voice-agent/megakernel/qwen_megakernel/checks   # all scripts run from here
+pip install qwen-tts                                # TTS model stack (registers qwen3_tts)
 
 # Step 0 sanity (optional):
-python -m qwen_megakernel.bench              # prove the kernel builds (~1000 tok/s)
+python -m qwen_megakernel.bench   # (run from ../ , the kernel dir) prove build (~1000 tok/s)
 python check_cfg.py                          # GO/NO-GO talker config
 
 # Phase 4a/4b parity:
@@ -74,6 +74,10 @@ LDG_VOCAB_SIZE=3072 python parity_frame16.py # full 16-code frame     -> 13/16
 python ear_test.py "Hello, this is a test of the speech kernel."
 # -> writes ear_ref.wav and ear_drift.wav; download + compare by ear
 ```
+
+> `python -m qwen_megakernel.bench` is the **upstream** bench and must run from the kernel dir
+> (`cd ..` first), since `-m` needs `qwen_megakernel` as a top-level package. Our scripts in
+> `checks/` add the parent to `sys.path` themselves, so they run from `checks/` directly.
 
 > **Note:** `LDG_VOCAB_SIZE=3072` is required for `parity_code0`/`parity_frame16` — without it
 > the kernel compiles for vocab 151936 and reads past the 3072-row `codec_head` (illegal
