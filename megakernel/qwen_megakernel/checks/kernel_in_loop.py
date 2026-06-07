@@ -55,7 +55,11 @@ def main():
     # Kernel decoder (talker weights packed for the kernel).
     dec, _ = build_talker_decoder(verbose=False)
     # Wrapper around the PyTorch model for the generate() helpers + the loop.
-    tts = Qwen3TTSModel.from_pretrained("Qwen/Qwen3-TTS-12Hz-0.6B-Base")
+    # Force CUDA + bf16 to match the kernel decoder (default load is CPU -> device
+    # mismatch when our CUDA hook tensors meet the model).
+    tts = Qwen3TTSModel.from_pretrained(
+        "Qwen/Qwen3-TTS-12Hz-0.6B-Base", dtype=torch.bfloat16, device_map="cuda"
+    )
     model = tts.model
     talker_model = model.talker.model
     tok = model.speech_tokenizer
