@@ -1,18 +1,25 @@
 # Megakernel Port — Verified Findings & Index
 
-**Date:** 2026-06-07 · **Status:** **Phase 4a + 4b PASSED + audibly verified** on a real
-RTX 5090. The ported kernel runs the Qwen3-TTS talker correctly:
+**Date:** 2026-06-07 · **Status:** **Phases 4a + 4b + 4c COMPLETE + audibly verified** on a
+real RTX 5090. The ported megakernel runs the Qwen3-TTS talker backbone end-to-end inside the
+real generation loop and produces correct speech:
 - **4a** body parity to bf16 noise (max abs diff 0.0078).
 - **4b code0** — full 28-layer decode + output stage (vocab 3072 + `codec_head` + argmax)
   produces the **exact** same codebook-0 token as PyTorch (both 1497, decisive margin).
 - **4b frame** — full 16-code frame is **13/16** (first 12 exact; last few drift from bf16
   accumulation over 28 layers — the kernel's only approximation).
 - **Ear test** — the tail-codebook drift is **inaudible**: randomizing the last 4 codebooks
-  per frame (far worse than the kernel's near-misses) produces audio indistinguishable from
-  the clean PyTorch reference. **So the kernel's output is audibly correct for TTS.**
+  per frame (far worse than the kernel's near-misses) is indistinguishable from the clean
+  PyTorch reference.
+- **4c kernel-in-the-loop** — the kernel runs the 28-layer backbone **every decode step** of
+  a full voice-clone utterance (KV cache seeded from PyTorch's prefill, fed via the new
+  `decode_from_hidden` op). VERIFY mode confirmed per-step hidden parity over the whole
+  utterance; VERIFY=0 substitutes the kernel hidden and renders `kernel_out.wav` — **real,
+  kernel-driven, correct-sounding TTS audio.**
 
-Next (optional): Phase 4c — wire the kernel into the full voice-clone generate loop (needs
-prefill KV-cache translation) and/or into the Pipecat voice agent.
+**The port is done:** the megakernel correctly drives the talker from a single layer all the
+way to end-to-end spoken audio. Remaining work is optional productionization (speed tuning;
+wiring into the Pipecat voice agent in `inference_server/`).
 
 This folder groups everything about porting the `AlpinDale/qwen_megakernel` CUDA kernel
 to drive the **Qwen3-TTS talker**: the vendored kernel source, the port, the tests, the
@@ -406,6 +413,45 @@ the codec is largely insensitive to.
 
 **Conclusion:** the megakernel produces **audibly correct** Qwen3-TTS talker output. The body
 math, the output stage, and the end-to-end sound are all verified.
+
+---
+
+## 6e. Phase 4c — KERNEL IN THE LOOP (end-to-end audio) — DONE ✅
+
+4a/4b proved the kernel in *isolation* (one token, one frame, fed by PyTorch). 4c puts it in
+the **real generation loop**: the kernel runs the 28-layer backbone for **every decode step**
+of a full voice-clone utterance.
+
+### The blocker and how it was solved
+- The talker feeds each step a **summed code-embedding vector**, not a token id — but the
+  kernel's `decode` only took a token id (it did its own embedding lookup). **Fix:** added a
+  `decode_from_hidden` op (`kernel.cu` + binding) — an optional `input_hidden` pointer; when
+  set, layer 0 reads it directly instead of `embed[token_id]`. Verified bit-identical to
+  `decode` (`test_decode_from_hidden.py`: max diff 0.000000).
+- The kernel needs the **prefill context** (voice-clone prompt) in its KV cache, but has no
+  multi-token prefill path. **Fix:** the kernel KV cache `(L,8,MAX,128)` and PyTorch's
+  `DynamicCache` per-layer K/V `(1,8,seq,128)` are layout-compatible — `kernel_in_loop.py`
+  **copies PyTorch's post-prefill K/V into the kernel cache** on the first decode step.
+
+### Wiring (`kernel_in_loop.py`)
+A pre-hook on `talker.model` captures each step's `inputs_embeds`; a post-hook runs
+`decode_from_hidden` at the current position, takes the kernel's pre-norm `_hidden`, applies
+PyTorch's `talker.model.norm`, and (VERIFY=0) overwrites `last_hidden_state`. PyTorch still
+runs the `code_predictor` (codes 1–15) + codec.
+
+### Result
+- **VERIFY=1** — per-step hidden parity over the whole utterance confirmed (matches the
+  ~0.2 28-layer bf16 floor; the cache seeding + position bookkeeping are correct).
+- **VERIFY=0** — substitutes the kernel hidden and renders `kernel_out.wav`: **real,
+  kernel-driven TTS audio that speaks the sentence correctly.**
+
+### Gotchas hit (documented for the next run / juniors)
+- transformers 5.x renamed the cache API: use `cache.layers[L].keys/.values`, not the old
+  `key_cache`/`value_cache` (added a shim).
+- Load the PyTorch model on **CUDA + bf16** (`device_map="cuda"`) — default is CPU → device
+  mismatch with the kernel's CUDA tensors.
+- The loop is **slow in VERIFY mode** (runs PyTorch *and* the kernel + a per-step
+  `cuda.synchronize()`); per-step progress prints show it's advancing. Use a short input first.
 
 ---
 
