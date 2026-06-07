@@ -1328,7 +1328,11 @@ __global__ void __launch_bounds__(LDG_BLOCK_SIZE, 1) ldg_decode_kernel_direct(
     unsigned int *__restrict__ barrier_sense,
     unsigned int *__restrict__ kv_flag, unsigned int *__restrict__ attn_flag,
     int num_layers, int position, int input_token_id, int max_seq_len,
-    float attn_scale) {
+    float attn_scale,
+    // Phase 4c: optional direct hidden input. When non-null, layer 0 reads this
+    // (1024-dim bf16) vector instead of doing an embedding lookup by token id.
+    // Lets the kernel consume the talker's summed code-embedding per step.
+    const __nv_bfloat16 *__restrict__ input_hidden = nullptr) {
   int cache_len = position + 1;
   int block_id = blockIdx.x;
   int num_blocks = gridDim.x;
@@ -1359,7 +1363,11 @@ __global__ void __launch_bounds__(LDG_BLOCK_SIZE, 1) ldg_decode_kernel_direct(
   AtomicGridSync grid{barrier_counter, barrier_sense, (unsigned int)gridDim.x,
                       1};
 
-  const __nv_bfloat16 *embed_row = embed_weight + input_token_id * HIDDEN_SIZE;
+  // Phase 4c: if a precomputed input hidden was supplied, layer 0 reads it
+  // directly (the talker's summed code-embedding); else look up by token id.
+  const __nv_bfloat16 *embed_row =
+      (input_hidden != nullptr) ? input_hidden
+                                : (embed_weight + input_token_id * HIDDEN_SIZE);
 
   int kv_cache_layer_stride = NUM_KV_HEADS * max_seq_len * HEAD_DIM;
 
@@ -1485,7 +1493,8 @@ extern "C" void launch_ldg_decode_direct(
     void *g_residual, void *g_q, void *g_k, void *g_v, void *g_attn_out,
     void *g_mlp_intermediate, void *g_normalized, void *block_max_vals,
     void *block_max_idxs, int num_layers, int position, int max_seq_len,
-    float attn_scale, cudaStream_t stream) {
+    float attn_scale, cudaStream_t stream,
+    const void *input_hidden = nullptr) {  // Phase 4c: optional direct hidden input
   ldg_configure_kernel_attributes();
   ensure_barrier_alloc();
 
@@ -1498,7 +1507,8 @@ extern "C" void launch_ldg_decode_direct(
       (float *)g_residual, (float *)g_q, (float *)g_k, (float *)g_v,
       (float *)g_attn_out, (float *)g_mlp_intermediate, (float *)g_normalized,
       d_barrier_counter, d_barrier_sense, d_kv_flag, d_attn_flag, num_layers,
-      position, input_token_id, max_seq_len, attn_scale);
+      position, input_token_id, max_seq_len, attn_scale,
+      (const __nv_bfloat16 *)input_hidden);
 
   cudaMemsetAsync(d_lm_head_counter, 0, sizeof(unsigned int), stream);
   ldg_lm_head_fused<<<LDG_LM_NUM_BLOCKS, LDG_LM_BLOCK_SIZE, 0, stream>>>(
