@@ -112,6 +112,24 @@ class StreamingTTSEngine:
         self._voice = self._build_voice_clone()
         self._warmed = False
 
+        # --- optional megakernel backbone (USE_KERNEL=1) -------------------
+        # When enabled, the RTX 5090 megakernel runs the 28-layer talker backbone
+        # each decode step in place of PyTorch's layers (code_predictor + codec
+        # stay PyTorch). Verified equivalent + audibly identical — see
+        # megakernel/README.md. Falls back to PyTorch if kernel init fails.
+        self._use_kernel = os.environ.get("USE_KERNEL", "0") == "1"
+        self._kdec = None
+        if self._use_kernel:
+            try:
+                from qwen_tts_megakernel.model_tts import build_talker_decoder
+                self._kdec, _ = build_talker_decoder(verbose=False)
+                self._dfh = torch.ops.qwen_tts_megakernel_C.decode_from_hidden
+                print("[engine] USE_KERNEL=1 — megakernel backbone active")
+            except Exception as e:
+                print(f"[engine] USE_KERNEL=1 but kernel init failed ({e}); "
+                      "falling back to PyTorch backbone")
+                self._use_kernel = False
+
     def warmup(self, text: str = "warm up") -> None:
         """Run one throwaway generate so the first real request isn't the cold
         outlier (the first-ever generate() after load primes lazy model state and
@@ -177,6 +195,8 @@ class StreamingTTSEngine:
 
         frame_q: "queue.Queue" = queue.Queue()
         self._install_frame_hook(frame_q, metrics)
+        if self._use_kernel:
+            self._install_kernel_backbone_hook()
 
         def _run_generate():
             try:
@@ -218,6 +238,8 @@ class StreamingTTSEngine:
             metrics.last_frame_t = time.perf_counter()
             worker.join(timeout=1.0)
             self._remove_frame_hook()
+            if self._use_kernel:
+                self._remove_kernel_backbone_hook()
 
     # ---- frame hook: push each step's 16-code frame onto the queue ----
     def _install_frame_hook(self, frame_q: "queue.Queue", metrics: StreamMetrics):
@@ -257,6 +279,75 @@ class StreamingTTSEngine:
         if h is not None:
             h.remove()
             self._hook_handle = None
+
+    # ---- megakernel backbone hooks (USE_KERNEL=1) ----
+    def _install_kernel_backbone_hook(self):
+        """Run the megakernel 28-layer backbone each decode step in place of
+        PyTorch's layers. pre-hook captures inputs_embeds; post-hook seeds the
+        kernel KV cache from PyTorch's prefill (first decode step), runs
+        decode_from_hidden, and overwrites last_hidden_state with the kernel's
+        (pre-norm _hidden + PyTorch final norm — the faithful path). Verified
+        reference: megakernel/.../checks/kernel_in_loop.py.
+        """
+        talker_model = self.model.talker.model
+        dec = self._kdec
+        st = {"seeded": False, "emb": None}
+
+        def _layer_kv(pkv, L):
+            if hasattr(pkv, "layers"):
+                return pkv.layers[L].keys, pkv.layers[L].values
+            return pkv.key_cache[L], pkv.value_cache[L]
+
+        def _seed(pkv):
+            kc, vc = dec._k_cache, dec._v_cache
+            for L in range(kc.shape[0]):
+                k, v = _layer_kv(pkv, L)
+                n = min(k.shape[2], kc.shape[2])
+                kc[L, :, :n, :] = k[0, :, :n, :].to(kc.dtype)
+                vc[L, :, :n, :] = v[0, :, :n, :].to(vc.dtype)
+
+        def pre_hook(_m, args, kwargs):
+            emb = kwargs.get("inputs_embeds")
+            if emb is None and args:
+                emb = args[0]
+            st["emb"] = emb
+
+        def post_hook(_m, _a, _kw, output):
+            hs = output.last_hidden_state
+            if hs.shape[1] != 1:          # prefill — PyTorch handles it
+                return output
+            pkv = output.past_key_values
+            pos = pkv.get_seq_length() - 1
+            if not st["seeded"]:
+                _seed(pkv)
+                st["seeded"] = True
+            emb = st["emb"].detach().to(torch.bfloat16).reshape(-1).contiguous()
+            dec._position = pos
+            self._dfh(
+                dec._out_token, emb,
+                dec._embed_weight, dec._layer_weights_packed,
+                dec._final_norm_weight, dec._lm_head_weight,
+                dec._cos_table, dec._sin_table, dec._k_cache, dec._v_cache,
+                dec._hidden, dec._act, dec._res, dec._q, dec._k, dec._v,
+                dec._attn_out, dec._mlp_inter, dec._norm_out,
+                dec._bmax_vals, dec._bmax_idxs,
+                28, pos, dec._k_cache.shape[2], dec._attn_scale,
+            )
+            k_pre = dec._hidden.detach().to(torch.bfloat16).view(1, 1, -1)
+            output.last_hidden_state = talker_model.norm(k_pre)
+            return output
+
+        self._k_pre_handle = talker_model.register_forward_pre_hook(
+            pre_hook, with_kwargs=True)
+        self._k_post_handle = talker_model.register_forward_hook(
+            post_hook, with_kwargs=True)
+
+    def _remove_kernel_backbone_hook(self):
+        for attr in ("_k_pre_handle", "_k_post_handle"):
+            h = getattr(self, attr, None)
+            if h is not None:
+                h.remove()
+                setattr(self, attr, None)
 
     # ---- batched reference path (used by parity_check) ----
     def generate_batched_codes(self, text: str, cfg: Optional[StreamConfig] = None):

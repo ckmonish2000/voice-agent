@@ -31,7 +31,7 @@ class QwenWSTTSService(TTSService):
     """Streams audio from the Qwen3-TTS WebSocket inference server."""
 
     def __init__(self, *, uri: str = "ws://localhost:8000/tts",
-                 sample_rate: int = 24000, preroll_secs: float = 2.5, **kwargs):
+                 sample_rate: int = 24000, preroll_secs: float = 0.0, **kwargs):
         # The voice is fixed server-side (the reference-clone clip), so model/
         # voice/language have no per-request meaning here; set them to None to
         # satisfy TTSSettings validation.
@@ -44,9 +44,12 @@ class QwenWSTTSService(TTSService):
         )
         self._uri = uri
         self._sample_rate = sample_rate
-        # Jitter buffer pre-roll: how many seconds of audio to accumulate before
-        # we start playback. Bigger = smoother but more initial delay. Converted
-        # to bytes: sample_rate * 2 bytes/sample (int16) * 1 channel.
+        # Jitter buffer pre-roll: seconds of audio to accumulate before playback.
+        # DEFAULT 0.0 = pure frame-by-frame streaming (no buffering) — correct for
+        # the RTX 5090 server (RTF ~0.5, generates faster than real time, so the
+        # transport never underruns). Raise it (e.g. QWEN_TTS_PREROLL=2.5) only for
+        # slow backends (Mac/MPS) where streaming each chunk would break up.
+        # Converted to bytes: sample_rate * 2 bytes/sample (int16) * 1 channel.
         self._preroll_bytes = int(preroll_secs * sample_rate * 2)
 
     def can_generate_metrics(self) -> bool:
