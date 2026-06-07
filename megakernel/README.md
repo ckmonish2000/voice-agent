@@ -51,37 +51,59 @@ megakernel/
 | `parity_frame16.py` | **Phase 4b.** Full 16-code frame (kernel hidden + code0 → PyTorch predictor for 1–15). 13/16, first 12 exact (bf16 floor). |
 | `diag_hidden.py` | Diagnostic: compares kernel buffers vs PyTorch pre/post-norm hidden. |
 | `ear_test.py` | Codec ear-test: perturb tail codebooks, decode two wavs, listen — is the drift audible? |
+| `setup_and_verify.sh` | **One-shot box setup.** Installs deps, verifies RTX 5090 + nvcc ≥ 12.8 + torch/CUDA, builds the kernel, runs the parity suite. Run this first on a fresh box. |
 | `check_cfg.py` / `dump_weights.py` / `check_positions.py` / `capture_reference.py` | Step-0 helpers (config, weight names, MRoPE check, ground-truth capture). |
 | `docs/…` | Roadmap + Vast.ai runbook. |
 
-## Running on the box (clone → cd → run, no copying)
+## Running on the box
 
+### Prerequisite — the box itself
+Rent an **RTX 5090** on Vast.ai with a **CUDA ≥ 12.8 `-devel`** PyTorch image (ships `nvcc`;
+the kernel JIT-compiles on first run). Verified-good image: `vastai/pytorch_cuda-13.0.2-auto`.
+Disk ≥ 40 GB. See `docs/2026-06-06-megakernel-vast-setup.md` for the full rent runbook.
+
+### Fastest path — one script (recommended)
 ```bash
 git clone https://github.com/ckmonish2000/voice-agent.git
-cd voice-agent/megakernel/qwen_megakernel/checks   # all scripts run from here
-pip install qwen-tts                                # TTS model stack (registers qwen3_tts)
+cd voice-agent/megakernel/qwen_megakernel/checks
+bash setup_and_verify.sh
+```
+`setup_and_verify.sh` installs deps, **verifies the box** (RTX 5090 + nvcc ≥ 12.8 + torch sees
+CUDA), JIT-builds the kernel, and runs the full parity suite (4a, 4b code0, 4b frame). It stops
+with a clear error if the box is wrong (not a 5090 / no nvcc / CUDA too old).
 
-# Step 0 sanity (optional):
-python -m qwen_megakernel.bench   # (run from ../ , the kernel dir) prove build (~1000 tok/s)
-python check_cfg.py                          # GO/NO-GO talker config
+### Manual path (same steps, run individually)
+```bash
+git clone https://github.com/ckmonish2000/voice-agent.git
+cd voice-agent/megakernel/qwen_megakernel/checks
+pip install qwen-tts ninja soundfile          # qwen-tts NOT in upstream reqs — required here
 
-# Phase 4a/4b parity:
-python parity_single.py                      # body parity            -> PASS (0.0078)
-LDG_VOCAB_SIZE=3072 python parity_code0.py   # code0 parity (recompiles 3072) -> PASS
-LDG_VOCAB_SIZE=3072 python parity_frame16.py # full 16-code frame     -> 13/16
+# --- verify the box works (do this first on any new box) ---
+nvidia-smi | grep 5090                         # must show RTX 5090
+nvcc --version                                 # must be release >= 12.8
+python -c "import torch; print(torch.__version__, torch.version.cuda, torch.cuda.is_available(), torch.cuda.get_device_name(0))"
+# expect: ... True NVIDIA GeForce RTX 5090
 
-# Ear test (does the tail-code drift sound different?):
+# --- build sanity (upstream bench; run from the kernel dir, -m needs the package) ---
+( cd .. && python -m qwen_megakernel.bench )   # ~1000 tok/s
+
+# --- parity suite (run from checks/) ---
+python parity_single.py                        # 4a body parity        -> PASS (0.0078)
+LDG_VOCAB_SIZE=3072 python parity_code0.py     # 4b code0 parity        -> PASS (recompiles)
+LDG_VOCAB_SIZE=3072 python parity_frame16.py   # 4b full 16-code frame  -> 13/16
+
+# --- ear test (does the tail-code drift sound different?) ---
 python ear_test.py "Hello, this is a test of the speech kernel."
 # -> writes ear_ref.wav and ear_drift.wav; download + compare by ear
 ```
 
-> `python -m qwen_megakernel.bench` is the **upstream** bench and must run from the kernel dir
-> (`cd ..` first), since `-m` needs `qwen_megakernel` as a top-level package. Our scripts in
-> `checks/` add the parent to `sys.path` themselves, so they run from `checks/` directly.
+> **`LDG_VOCAB_SIZE=3072` is required** for `parity_code0`/`parity_frame16` — without it the
+> kernel compiles for vocab 151936 and reads past the 3072-row `codec_head` (illegal memory
+> access). The JIT recompiles automatically when the flag changes.
 
-> **Note:** `LDG_VOCAB_SIZE=3072` is required for `parity_code0`/`parity_frame16` — without it
-> the kernel compiles for vocab 151936 and reads past the 3072-row `codec_head` (illegal
-> memory access). The JIT recompiles automatically when the flag changes.
+> `python -m qwen_megakernel.bench` runs from the **kernel dir** (`cd ..`), since `-m` needs
+> `qwen_megakernel` as a top-level package. Our `checks/` scripts add the parent to `sys.path`
+> themselves, so they run from `checks/` directly.
 
 ---
 

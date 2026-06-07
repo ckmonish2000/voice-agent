@@ -3,3 +3,8 @@ transformers>=4.40.0
 triton>=2.2.0
 ninja
 accelerate
+# qwen-tts: the Qwen3-TTS model stack + the qwen3_tts arch our checks/ scripts
+# load (registers the arch, ships the codec/processor). NOT in upstream; required
+# for everything under checks/.
+qwen-tts
+soundfile
