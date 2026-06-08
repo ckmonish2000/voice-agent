@@ -39,21 +39,12 @@ def sync():
         torch.cuda.synchronize()
 
 
-# --- time the talker.forward as a whole (one full decode step) ---
-talker = eng.model.talker
-orig_talker_fwd = talker.forward
-step_times = []
-
-
-def timed_talker(*a, **k):
-    sync(); t0 = time.perf_counter()
-    out = orig_talker_fwd(*a, **k)
-    sync()
-    step_times.append((time.perf_counter() - t0) * 1000)
-    return out
-
-
-talker.forward = timed_talker
+# NOTE: we deliberately do NOT wrap talker.forward — it sits behind a
+# @check_model_inputs decorator that strips extra kwargs; wrapping it bypasses
+# that and raises "model_kwargs not used". Instead we measure the whole step via
+# the frame hook timestamps (eng.last_metrics.frame_arrival_ts) and time only the
+# inner pieces that have no such decorator: talker.model.forward and tok.decode.
+step_times = []  # filled from metrics after the run (inter-frame wall time)
 
 # --- time the codec decode (inside the frame hook) ---
 tok = eng.model.speech_tokenizer
@@ -91,7 +82,7 @@ print("[diag] warming up...", flush=True)
 for _ in eng.decode_stream("warm up please", StreamConfig(max_new_tokens=24)):
     pass
 
-step_times.clear(); codec_times.clear(); backbone_times.clear()
+codec_times.clear(); backbone_times.clear()
 print("[diag] measured run...\n", flush=True)
 
 n = 0
@@ -99,6 +90,10 @@ for _ in eng.decode_stream(
         "The quick brown fox jumps over the lazy dog and runs home.",
         StreamConfig(max_new_tokens=512)):
     n += 1
+
+# whole-step wall time from frame arrival timestamps (gap between frames)
+ts = eng.last_metrics.frame_arrival_ts
+step_times = [(ts[i+1] - ts[i]) * 1000 for i in range(len(ts) - 1)]
 
 print("========== PER-STEP TIMING ==========", flush=True)
 
@@ -114,7 +109,7 @@ def stats(name, arr):
           flush=True)
 
 
-stats("talker.forward/step", step_times)
+stats("whole step (frame gap)", step_times)
 stats("  backbone (kernel)", backbone_times)
 stats("  codec decode", codec_times)
 print("  ---", flush=True)
