@@ -36,7 +36,8 @@ megakernel/
 ├── README.md                       ← this file: verified results + usage
 ├── docs/
 │   ├── 2026-06-06-megakernel-roadmap.md     ← why the fast path exists (context)
-│   └── 2026-06-06-megakernel-vast-setup.md  ← step-by-step Vast.ai runbook
+│   ├── 2026-06-06-megakernel-vast-setup.md  ← step-by-step Vast.ai runbook
+│   └── 2026-06-07-inference-integration-and-deploy.md  ← wire kernel into the server + deploy
 └── qwen_tts_megakernel/            ← THE package (clone target)
     ├── csrc/
     │   ├── kernel.cu                   fused 28-layer kernel (LDG_VOCAB_SIZE flag + decode_from_hidden)

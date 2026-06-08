@@ -73,6 +73,7 @@ class StreamConfig:
     max_new_tokens: int = 512
     window: int = DEFAULT_WINDOW
     hop: int = DEFAULT_HOP
+    first_hop: int = 1  # emit the first chunk after this many frames (low TTFC)
     seed: Optional[int] = None  # set for deterministic parity runs
     # sampling (mirror the wrapper defaults so parity holds against generate())
     do_sample: bool = True
@@ -111,6 +112,24 @@ class StreamingTTSEngine:
         )
         self._voice = self._build_voice_clone()
         self._warmed = False
+
+        # --- optional megakernel backbone (USE_KERNEL=1) -------------------
+        # When enabled, the RTX 5090 megakernel runs the 28-layer talker backbone
+        # each decode step in place of PyTorch's layers (code_predictor + codec
+        # stay PyTorch). Verified equivalent + audibly identical — see
+        # megakernel/README.md. Falls back to PyTorch if kernel init fails.
+        self._use_kernel = os.environ.get("USE_KERNEL", "0") == "1"
+        self._kdec = None
+        if self._use_kernel:
+            try:
+                from qwen_tts_megakernel.model_tts import build_talker_decoder
+                self._kdec, _ = build_talker_decoder(verbose=False)
+                self._dfh = torch.ops.qwen_tts_megakernel_C.decode_from_hidden
+                print("[engine] USE_KERNEL=1 — megakernel backbone active")
+            except Exception as e:
+                print(f"[engine] USE_KERNEL=1 but kernel init failed ({e}); "
+                      "falling back to PyTorch backbone")
+                self._use_kernel = False
 
     def warmup(self, text: str = "warm up") -> None:
         """Run one throwaway generate so the first real request isn't the cold
@@ -175,8 +194,31 @@ class StreamingTTSEngine:
             top_k=cfg.top_k,
         )
 
-        frame_q: "queue.Queue" = queue.Queue()
-        self._install_frame_hook(frame_q, metrics)
+        # PCM queue carries finished audio bytes (NOT raw frames). All GPU work —
+        # backbone, code_predictor AND codec decode — runs on the worker thread,
+        # serialized by generate()'s own loop (the codec decode happens inside the
+        # frame hook, which fires synchronously on the worker thread each step).
+        # The foreground does ZERO GPU work; it only drains bytes off the queue.
+        #
+        # Why: a single process-wide CUDA context is shared by all threads. The
+        # earlier design ran generate() on a worker thread and the codec decode on
+        # the foreground thread — two threads issuing GPU work concurrently, which
+        # deadlocked (worker froze mid-generate, codec blocked, no PCM ever out;
+        # see diag_hang.py: 13 frames produced, 0 chunks emitted, both threads
+        # alive but stuck). Keeping every CUDA call on ONE thread (the way the
+        # verified kernel_in_loop.py does) fixes it while preserving streaming.
+        pcm_q: "queue.Queue" = queue.Queue()
+        decoder = _SlidingCodecDecoder(
+            self.model.speech_tokenizer,
+            ref_code=self._voice["ref_code"].to(self.device),
+            window=cfg.window,
+            hop=cfg.hop,
+            first_hop=cfg.first_hop,
+            device=self.device,
+        )
+        self._install_frame_hook(pcm_q, metrics, decoder)
+        if self._use_kernel:
+            self._install_kernel_backbone_hook()
 
         def _run_generate():
             try:
@@ -189,44 +231,50 @@ class StreamingTTSEngine:
                         non_streaming_mode=False,
                         **gen_kwargs,
                     )
+                # generation finished: flush the codec tail (still on this thread,
+                # the only thread that touches the GPU).
+                tail = decoder.flush()
+                if tail is not None and len(tail) > 0:
+                    pcm_q.put(tail)
+            except Exception as e:  # surface worker crashes instead of hanging
+                import traceback
+                traceback.print_exc()
+                pcm_q.put(("__error__", repr(e)))
             finally:
-                frame_q.put(_FRAME_SENTINEL)
+                pcm_q.put(_FRAME_SENTINEL)
 
         worker = threading.Thread(target=_run_generate, daemon=True)
         worker.start()
 
-        # Foreground: drain frames, sliding-window codec decode, emit PCM tail.
-        decoder = _SlidingCodecDecoder(
-            self.model.speech_tokenizer,
-            ref_code=self._voice["ref_code"].to(self.device),
-            window=cfg.window,
-            hop=cfg.hop,
-            device=self.device,
-        )
+        # Foreground: drain finished PCM bytes only — no GPU work here.
         try:
             while True:
-                frame = frame_q.get()
-                if frame is _FRAME_SENTINEL:
+                item = pcm_q.get()
+                if item is _FRAME_SENTINEL:
                     break
-                pcm = decoder.push(frame.to(self.device))
-                if pcm is not None and len(pcm) > 0:
-                    yield pcm
-            tail = decoder.flush()
-            if tail is not None and len(tail) > 0:
-                yield tail
+                if isinstance(item, tuple) and item and item[0] == "__error__":
+                    raise RuntimeError(f"generation worker failed: {item[1]}")
+                if item is not None and len(item) > 0:
+                    yield item
         finally:
             metrics.last_frame_t = time.perf_counter()
-            worker.join(timeout=1.0)
+            worker.join(timeout=5.0)
             self._remove_frame_hook()
+            if self._use_kernel:
+                self._remove_kernel_backbone_hook()
 
-    # ---- frame hook: push each step's 16-code frame onto the queue ----
-    def _install_frame_hook(self, frame_q: "queue.Queue", metrics: StreamMetrics):
-        """Push each generated frame to the queue as the talker produces it.
+    # ---- frame hook: decode each step's frame to PCM on the worker thread ----
+    def _install_frame_hook(self, pcm_q: "queue.Queue", metrics: StreamMetrics,
+                            decoder: "_SlidingCodecDecoder"):
+        """Decode each generated frame to PCM as the talker produces it, then
+        push the finished bytes onto the queue.
 
         talker.forward returns hidden_states=(layer_hidden_states, codec_ids).
         On generate steps (seq len 1) codec_ids is the (1,16) frame for this
-        step; on the prefill step it is None. We forward each real frame
-        immediately, skipping the EOS frame.
+        step; on the prefill step it is None. We feed each real frame to the
+        sliding-window codec decoder *here* — i.e. on the same (worker) thread
+        that runs generate(), so every CUDA call is serialized on one thread.
+        The EOS frame is skipped.
         """
         talker = self.model.talker
         eos = self._eos
@@ -239,7 +287,7 @@ class StreamingTTSEngine:
             codec_ids = hs[1]
             if codec_ids is None:
                 return output  # prefill step
-            frame = codec_ids.detach().to("cpu").view(-1)[:16]
+            frame = codec_ids.detach().view(-1)[:16]
             if int(frame[0]) == eos:
                 return output
             now = time.perf_counter()
@@ -247,7 +295,10 @@ class StreamingTTSEngine:
                 metrics.first_frame_t = now
             metrics.frame_arrival_ts.append(now)
             metrics.num_frames += 1
-            frame_q.put(frame.clone())
+            # codec decode on THIS (worker) thread — emit PCM tail if a hop is ready
+            pcm = decoder.push(frame.to(self.device))
+            if pcm is not None and len(pcm) > 0:
+                pcm_q.put(pcm)
             return output
 
         self._hook_handle = talker.register_forward_hook(_hook)
@@ -257,6 +308,110 @@ class StreamingTTSEngine:
         if h is not None:
             h.remove()
             self._hook_handle = None
+
+    # ---- megakernel backbone: REPLACE PyTorch's forward (USE_KERNEL=1) ----
+    def _install_kernel_backbone_hook(self):
+        """Run the megakernel backbone INSTEAD OF PyTorch's 28 layers on each
+        decode step (not as an after-the-fact hook).
+
+        Why a forward REPLACEMENT, not a forward hook: a forward hook fires AFTER
+        the module already ran all 28 PyTorch layers (~42 ms/step measured) — and
+        we then overwrote the result with the kernel (~1 ms). That wasted the 42
+        ms every step. By swapping `talker.model.forward` we skip the PyTorch
+        layers entirely on decode steps.
+
+        Correctness:
+          - PREFILL (seq len > 1): call the ORIGINAL forward. PyTorch builds the
+            real KV cache from the prompt; we seed the kernel's own KV cache from
+            it (once).
+          - DECODE (seq len == 1): run the kernel (`decode_from_hidden`) to get
+            the pre-norm hidden, apply PyTorch's final `norm` (the exact verified
+            path from kernel_in_loop.py), and ADVANCE PyTorch's DynamicCache
+            length by 1 with a dummy 1-token k/v per layer. The kernel keeps its
+            OWN kv cache (dec._k_cache) and never reads PyTorch's; only PyTorch's
+            cache *length* matters (HF derives cache_position from it), so the
+            dummy contents are never read. Verified by parity_kernel_replace.py.
+        """
+        talker_model = self.model.talker.model
+        dec = self._kdec
+        st = {"seeded": False}
+        orig_forward = talker_model.forward
+
+        def _layer_kv(pkv, L):
+            if hasattr(pkv, "layers"):
+                return pkv.layers[L].keys, pkv.layers[L].values
+            return pkv.key_cache[L], pkv.value_cache[L]
+
+        def _seed(pkv):
+            kc, vc = dec._k_cache, dec._v_cache
+            for L in range(kc.shape[0]):
+                k, v = _layer_kv(pkv, L)
+                n = min(k.shape[2], kc.shape[2])
+                kc[L, :, :n, :] = k[0, :, :n, :].to(kc.dtype)
+                vc[L, :, :n, :] = v[0, :, :n, :].to(vc.dtype)
+
+        def _advance_cache_len(pkv):
+            """Append a dummy 1-token k/v to every layer so get_seq_length()
+            advances by 1 without running the layers. The dummy is never read
+            (the kernel uses its own kv cache)."""
+            for L in range(len(pkv.layers)):
+                k0, _ = _layer_kv(pkv, L)
+                b, h, _t, d = k0.shape
+                dummy = torch.zeros((b, h, 1, d), dtype=k0.dtype, device=k0.device)
+                pkv.update(dummy, dummy, L)
+
+        def kernel_forward(*args, **kwargs):
+            emb = kwargs.get("inputs_embeds")
+            if emb is None and args:
+                emb = args[0]
+            # prefill (or no embeds) -> let PyTorch do it (and seed the kernel kv)
+            if emb is None or emb.shape[1] != 1:
+                out = orig_forward(*args, **kwargs)
+                return out
+            pkv = kwargs.get("past_key_values")
+            if pkv is None:
+                # safety: can't advance an unknown cache -> fall back to PyTorch
+                return orig_forward(*args, **kwargs)
+            if not st["seeded"]:
+                _seed(pkv)
+                st["seeded"] = True
+            pos = pkv.get_seq_length()          # tokens so far == position of new token
+            flat = emb.detach().to(torch.bfloat16).reshape(-1).contiguous()
+            dec._position = pos
+            self._dfh(
+                dec._out_token, flat,
+                dec._embed_weight, dec._layer_weights_packed,
+                dec._final_norm_weight, dec._lm_head_weight,
+                dec._cos_table, dec._sin_table, dec._k_cache, dec._v_cache,
+                dec._hidden, dec._act, dec._res, dec._q, dec._k, dec._v,
+                dec._attn_out, dec._mlp_inter, dec._norm_out,
+                dec._bmax_vals, dec._bmax_idxs,
+                28, pos, dec._k_cache.shape[2], dec._attn_scale,
+            )
+            k_pre = dec._hidden.detach().to(torch.bfloat16).view(1, 1, -1)
+            last_hidden = talker_model.norm(k_pre)
+            _advance_cache_len(pkv)             # keep HF's position bookkeeping right
+            from transformers.modeling_outputs import BaseModelOutputWithPast
+            # The talker generate loop reads outputs.hidden_states as a tuple of
+            # per-layer tensors and uses hidden_states[-1][:, -1:] as past_hidden
+            # (which feeds the NEXT step's code_predictor). We expose a single
+            # "layer" = the kernel's last-token hidden so that read is valid and
+            # matches the pre-norm hidden the original path used for past_hidden.
+            return BaseModelOutputWithPast(
+                last_hidden_state=last_hidden,
+                past_key_values=pkv,
+                hidden_states=(k_pre,),
+                attentions=None,
+            )
+
+        self._orig_backbone_forward = orig_forward
+        talker_model.forward = kernel_forward
+
+    def _remove_kernel_backbone_hook(self):
+        orig = getattr(self, "_orig_backbone_forward", None)
+        if orig is not None:
+            self.model.talker.model.forward = orig
+            self._orig_backbone_forward = None
 
     # ---- batched reference path (used by parity_check) ----
     def generate_batched_codes(self, text: str, cfg: Optional[StreamConfig] = None):
@@ -293,11 +448,17 @@ class _SlidingCodecDecoder:
     glitch-free at boundaries.
     """
 
-    def __init__(self, speech_tokenizer, ref_code, window, hop, device):
+    def __init__(self, speech_tokenizer, ref_code, window, hop, device,
+                 first_hop=1):
         self._tok = speech_tokenizer
         self._ref = ref_code            # (R,16) reference voice codes
         self._window = window
         self._hop = hop
+        # first_hop: emit the FIRST chunk after this many frames (default 1) so
+        # the first word comes out ASAP (~one frame = ~80ms of audio) instead of
+        # waiting `hop` frames. After the first emission we use the normal hop to
+        # avoid paying the per-decode overhead too often.
+        self._first_hop = first_hop
         self._device = device
         self._buf: list = []            # generated frames (each (16,))
         self._emitted_frames = 0        # how many generated frames already emitted
@@ -319,7 +480,9 @@ class _SlidingCodecDecoder:
     def push(self, frame) -> Optional[bytes]:
         self._buf.append(frame.view(-1)[:16])
         unemitted = len(self._buf) - self._emitted_frames
-        if unemitted < self._hop:
+        # use the small first_hop until the first emission, then the normal hop
+        hop = self._first_hop if self._emitted_frames == 0 else self._hop
+        if unemitted < hop:
             return None
         # decode the tail window for context, emit only the new hop's samples
         start = max(0, len(self._buf) - self._window)
