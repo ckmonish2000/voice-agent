@@ -390,10 +390,15 @@ class StreamingTTSEngine:
             last_hidden = talker_model.norm(k_pre)
             _advance_cache_len(pkv)             # keep HF's position bookkeeping right
             from transformers.modeling_outputs import BaseModelOutputWithPast
+            # The talker generate loop reads outputs.hidden_states as a tuple of
+            # per-layer tensors and uses hidden_states[-1][:, -1:] as past_hidden
+            # (which feeds the NEXT step's code_predictor). We expose a single
+            # "layer" = the kernel's last-token hidden so that read is valid and
+            # matches the pre-norm hidden the original path used for past_hidden.
             return BaseModelOutputWithPast(
                 last_hidden_state=last_hidden,
                 past_key_values=pkv,
-                hidden_states=None,
+                hidden_states=(k_pre,),
                 attentions=None,
             )
 
