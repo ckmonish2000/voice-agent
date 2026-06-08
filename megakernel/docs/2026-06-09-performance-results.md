@@ -18,6 +18,21 @@ before the rain begins to fall."), via inference_server/bench_engine.py.
 The kernel makes the whole pipeline ~18% faster end-to-end. It does NOT reach
 the RTF<0.15 / TTFC<60ms targets — see the per-step breakdown for why.
 
+### After the first-word optimization (first_hop=1)
+
+Emitting the first codec chunk after 1 frame instead of 4 (StreamConfig.first_hop)
+cut TTFC sharply with no change to steady-state speed:
+
+| Metric           | kernel (hop=4) | kernel (first_hop=1) |
+|------------------|----------------|----------------------|
+| TTFC             | 837 ms         | 312 ms               |
+| first chunk gap  | ~745 ms        | 220 ms               |
+| RTF overall      | 2.441          | 2.377                |
+| RTF steady       | 2.431          | 2.353                |
+
+TTFC is the latency a listener feels first; it dropped ~2.7x. RTF is unchanged
+(steady-state is gated by the code_predictor, not by when the first chunk emits).
+
 ## Per-step breakdown (kernel path, measured via diag_step.py / diag_double.py)
 
 | Component                       | per step  | share |
