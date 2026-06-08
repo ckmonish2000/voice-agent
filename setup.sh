@@ -35,10 +35,13 @@ python -c "import torch,sys; sys.exit(0 if torch.cuda.is_available() and '5090' 
   || die "torch can't see the GPU — do NOT use 'uv run' (CPU-only env); use system python."
 
 bold "2/3  Install deps (without disturbing the box's CUDA torch)"
-# --no-deps on qwen-tts so it can't drag transformers/torch around; then its
-# runtime libs + our extras. torch/torchvision are left as the image shipped them.
+# --no-deps on qwen-tts/transformers so they can't drag torch/torchvision around;
+# but transformers 4.57.3 needs huggingface_hub <1.0 and accelerate 1.12.0, so we
+# pin those explicitly (the box ships hub 1.8.0 + accelerate 1.13.0, which are too
+# new and make transformers fail to import). torch/torchvision left untouched.
 pip install -q --no-deps "qwen-tts==0.1.1" "transformers==4.57.3" || die "core install failed"
-pip install -q accelerate librosa torchaudio onnxruntime einops soundfile ninja \
+pip install -q "huggingface_hub>=0.34.0,<1.0" "accelerate==1.12.0" \
+               librosa torchaudio onnxruntime einops soundfile ninja \
                fastapi uvicorn websockets || die "runtime deps install failed"
 pip install -q "pipecat-ai[webrtc,deepgram,silero,runner]==1.3.0" openai python-dotenv \
   || echo "  (pipecat deps failed — fine if you only need the inference server)"
