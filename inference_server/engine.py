@@ -73,6 +73,7 @@ class StreamConfig:
     max_new_tokens: int = 512
     window: int = DEFAULT_WINDOW
     hop: int = DEFAULT_HOP
+    first_hop: int = 1  # emit the first chunk after this many frames (low TTFC)
     seed: Optional[int] = None  # set for deterministic parity runs
     # sampling (mirror the wrapper defaults so parity holds against generate())
     do_sample: bool = True
@@ -212,6 +213,7 @@ class StreamingTTSEngine:
             ref_code=self._voice["ref_code"].to(self.device),
             window=cfg.window,
             hop=cfg.hop,
+            first_hop=cfg.first_hop,
             device=self.device,
         )
         self._install_frame_hook(pcm_q, metrics, decoder)
@@ -446,11 +448,17 @@ class _SlidingCodecDecoder:
     glitch-free at boundaries.
     """
 
-    def __init__(self, speech_tokenizer, ref_code, window, hop, device):
+    def __init__(self, speech_tokenizer, ref_code, window, hop, device,
+                 first_hop=1):
         self._tok = speech_tokenizer
         self._ref = ref_code            # (R,16) reference voice codes
         self._window = window
         self._hop = hop
+        # first_hop: emit the FIRST chunk after this many frames (default 1) so
+        # the first word comes out ASAP (~one frame = ~80ms of audio) instead of
+        # waiting `hop` frames. After the first emission we use the normal hop to
+        # avoid paying the per-decode overhead too often.
+        self._first_hop = first_hop
         self._device = device
         self._buf: list = []            # generated frames (each (16,))
         self._emitted_frames = 0        # how many generated frames already emitted
@@ -472,7 +480,9 @@ class _SlidingCodecDecoder:
     def push(self, frame) -> Optional[bytes]:
         self._buf.append(frame.view(-1)[:16])
         unemitted = len(self._buf) - self._emitted_frames
-        if unemitted < self._hop:
+        # use the small first_hop until the first emission, then the normal hop
+        hop = self._first_hop if self._emitted_frames == 0 else self._hop
+        if unemitted < hop:
             return None
         # decode the tail window for context, emit only the new hop's samples
         start = max(0, len(self._buf) - self._window)

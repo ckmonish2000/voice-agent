@@ -29,9 +29,11 @@ from qwen_ws_tts import QwenWSTTSService  # noqa: E402
 SR = 24000
 
 SYSTEM_PROMPT = (
-    "You are a friendly voice assistant. Keep replies short and conversational, "
-    "one or two sentences, because they will be spoken aloud. Do not use markdown, "
-    "lists, or emoji."
+    "You are a friendly voice assistant. Your replies are spoken aloud by a "
+    "text-to-speech model that synthesizes slower than real time, so BREVITY is "
+    "critical: answer in ONE short sentence, ideally under 15 words. Never use "
+    "markdown, lists, or emoji. Get to the point immediately; no filler like "
+    "'Sure!' or 'Great question'."
 )
 
 # Populated by build_pipeline_task so tests can inspect processor order.
