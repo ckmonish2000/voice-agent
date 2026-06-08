@@ -173,6 +173,21 @@ Measured on an **RTX 5090** (Vast.ai), warmed, on a ~6 s utterance, via
 `inference_server/debug_tools/bench_engine.py`. RTF = wall time ÷ audio duration
 (lower is better; <1 = faster than real time). TTFC = time to first audio chunk.
 
+> **Reproduce these on your own box.** From the repo root on the GPU machine
+> (after `bash setup.sh`):
+> ```bash
+> cd inference_server
+> # kernel backbone:
+> PYTHONPATH=../megakernel/qwen_tts_megakernel QWEN_DEVICE=cuda LDG_VOCAB_SIZE=3072 \
+> USE_KERNEL=1 python debug_tools/bench_engine.py
+> # PyTorch baseline (drop the kernel): run again with USE_KERNEL=0
+> QWEN_DEVICE=cuda USE_KERNEL=0 python debug_tools/bench_engine.py
+> ```
+> It warms up, runs one utterance, and prints TTFC / RTF / chunk gaps. Run both
+> ways to reproduce the kernel-vs-PyTorch comparison. For per-frame breakdowns and
+> the bug-hunting probes (codec-on-CPU, double-compute, etc.), see the other
+> scripts and the guide in `inference_server/debug_tools/README.md`.
+
 **Kernel backbone vs PyTorch backbone (full streaming server):**
 
 | Metric              | PyTorch backbone | **Kernel backbone** | Improvement |
