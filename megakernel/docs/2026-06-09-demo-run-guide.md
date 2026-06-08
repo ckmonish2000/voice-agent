@@ -19,13 +19,26 @@
 - Pipecat reaches the inference server through an SSH tunnel.
 - STT (Deepgram) and LLM (OpenAI) are cloud calls from your Mac — need API keys.
 
+## Streaming vs buffering (important — two separate layers)
+
+1. INFERENCE SERVER: genuinely streams. Proven: 19 chunks per ~6s utterance,
+   arriving ~778 ms apart (not one blob at the end). This is the brief's hard
+   constraint and it is met. (bench_engine.py: chunks=19, mean gap 778ms.)
+2. BROWSER PLAYBACK: controlled by QWEN_TTS_PREROLL.
+   - PREROLL=0  -> true streaming playback: each chunk plays the instant it
+     arrives. Honest end-to-end streaming; proves no buffering anywhere. May
+     stutter on long replies because at RTF~2.4 playback can outrun generation.
+   - PREROLL>0  -> buffer that many seconds before playing (smoother audio, but
+     that part is synthesize-then-play, NOT streaming — describe it honestly).
+
+This demo uses PREROLL=0 (true streaming). Keep replies short (system prompt
+already asks the LLM for 1–2 sentences) so playback keeps up.
+
 ## Reality check on latency (be honest in the demo)
 
 Measured server RTF ≈ 2.4 (slower than real time): generating ~4 s of speech
-takes ~10 s. So the demo is FUNCTIONAL but not snappy. For smooth playback we
-buffer the reply before playing it (QWEN_TTS_PREROLL), trading first-word latency
-for clean audio. Keep replies short (the system prompt already asks the LLM for
-1–2 sentences).
+takes ~10 s. The demo is FUNCTIONAL but not snappy, and with PREROLL=0 a longer
+reply may break up — that's the honest consequence of RTF>1, not a bug.
 
 ---
 
@@ -62,9 +75,9 @@ OPENAI_API_KEY=...
 
 ```bash
 cd /Users/monish/Desktop/HoloCron/voice-agent
-# point pipecat at the tunneled inference server, and buffer the reply for smooth
-# playback (RTF ~2.4 -> high preroll so audio doesn't break up):
-QWEN_TTS_URI=ws://localhost:8000/tts QWEN_TTS_PREROLL=30 \
+# PREROLL=0 -> true streaming playback (no buffering anywhere). Each chunk plays
+# as it arrives. (Set PREROLL=2.5 if you want a smoother take for the recording.)
+QWEN_TTS_URI=ws://localhost:8000/tts QWEN_TTS_PREROLL=0 \
 python pipecat_server/server.py -t webrtc
 ```
 (Use the SAME python env that has pipecat installed. On the Mac that's your
