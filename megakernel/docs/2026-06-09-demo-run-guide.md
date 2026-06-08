@@ -23,7 +23,7 @@
 
 1. INFERENCE SERVER: genuinely streams. Proven: 19 chunks per ~6s utterance,
    arriving ~778 ms apart (not one blob at the end). This is the brief's hard
-   constraint and it is met. (bench_engine.py: chunks=19, mean gap 778ms.)
+   constraint and it is met. (debug_tools/bench_engine.py: chunks=19, mean gap 778ms.)
 2. BROWSER PLAYBACK: controlled by QWEN_TTS_PREROLL.
    - PREROLL=0  -> true streaming playback: each chunk plays the instant it
      arrives. Honest end-to-end streaming; proves no buffering anywhere. May
@@ -75,19 +75,32 @@ OPENAI_API_KEY=...
 
 ```bash
 cd /Users/monish/Desktop/HoloCron/voice-agent
-# PREROLL=0 -> true streaming playback (no buffering anywhere). Each chunk plays
-# as it arrives. (Set PREROLL=2.5 if you want a smoother take for the recording.)
-QWEN_TTS_URI=ws://localhost:8000/tts QWEN_TTS_PREROLL=0 \
+QWEN_TTS_URI=ws://localhost:8000/tts \
 python pipecat_server/server.py -t webrtc
 ```
-(Use the SAME python env that has pipecat installed. On the Mac that's your
-project venv — NOT `uv run`.)
+(Use the SAME python env that has pipecat installed — NOT `uv run`.)
+Starts in V1 buffered mode by default; the UI toggle switches V1<->V2 live, so no
+QWEN_TTS_PREROLL needed (it's still honored as the buffered cushion size).
 
-## Step 5 — talk to it
+## Step 5 — on your MAC: start the React frontend (has the V1/V2 toggle)
 
-Open http://localhost:7860/client in your browser, allow mic access, and speak.
-On connect it greets you (proves the loop). Say something short; you'll hear the
-kernel-driven cloned voice reply after a few seconds.
+```bash
+cd /Users/monish/Desktop/HoloCron/voice-agent/frontend
+npm install      # first time only
+npm run dev
+```
+Open the printed URL (usually http://localhost:5173). NOTE: use this, not the
+pipecat built-in :7860/client — only the React app has the V1/V2 toggle button.
+
+## Step 6 — talk to it
+
+Connect, then hold **Speak** (or spacebar) and talk. On connect it greets you.
+Use the mode button to switch:
+  - **V1 Buffered (smooth)** — accumulates the reply, then plays cleanly.
+  - **V2 Realtime streaming** — each chunk plays as it arrives (may stutter at
+    RTF>1; this is the honest realtime behavior).
+The switch applies to the next utterance; the pipecat terminal logs
+`[voice_agent] TTS mode -> ...` to confirm.
 
 ## Recording the demo
 - Screen-record the browser + a terminal showing the server log (so the
@@ -97,7 +110,9 @@ kernel-driven cloned voice reply after a few seconds.
 
 ## Troubleshooting
 - `curl 8000/health` fails → tunnel down or server not ready; re-open Step 2.
-- Audio breaks up → raise QWEN_TTS_PREROLL.
+- Audio breaks up in V2 → expected at RTF>1; switch to V1, or raise the buffered
+  cushion via QWEN_TTS_PREROLL.
+- Toggle does nothing → make sure you're on the React app (:5173), not :7860/client;
+  check the pipecat terminal for `[voice_agent] TTS mode -> ...`.
 - Pipecat import errors on Mac → wrong env; use the venv with pipecat-ai==1.3.0.
 - "missing DEEPGRAM/OPENAI key" → fill repo-root .env (Step 3).
-```

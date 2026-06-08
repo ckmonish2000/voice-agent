@@ -28,7 +28,7 @@ import sys
 import time
 import queue
 
-sys.path.insert(0, os.path.dirname(__file__))
+sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))  # inference_server/ (parent)
 
 import torch  # noqa: E402
 from engine import (  # noqa: E402

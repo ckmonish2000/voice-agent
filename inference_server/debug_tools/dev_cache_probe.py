@@ -21,7 +21,7 @@ Then: cat _cache_probe.txt
 import sys
 import os
 
-sys.path.insert(0, os.path.dirname(__file__))
+sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))  # inference_server/ (parent)
 
 import torch  # noqa: E402
 from engine import StreamingTTSEngine, StreamConfig  # noqa: E402

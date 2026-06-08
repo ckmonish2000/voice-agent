@@ -2,7 +2,7 @@
 
 All numbers measured ON the box (RTX 5090), warmed, on a ~6 s utterance
 ("The quick brown fox jumps over the lazy dog, and then it runs back home
-before the rain begins to fall."), via inference_server/bench_engine.py.
+before the rain begins to fall."), via inference_server/debug_tools/bench_engine.py.
 
 ## Kernel vs PyTorch backbone (end-to-end, in the streaming server)
 
@@ -33,7 +33,7 @@ cut TTFC sharply with no change to steady-state speed:
 TTFC is the latency a listener feels first; it dropped ~2.7x. RTF is unchanged
 (steady-state is gated by the code_predictor, not by when the first chunk emits).
 
-## Per-step breakdown (kernel path, measured via diag_step.py / diag_double.py)
+## Per-step breakdown (kernel path, measured via debug_tools/diag_step.py / debug_tools/diag_double.py)
 
 | Component                       | per step  | share |
 |---------------------------------|-----------|-------|
@@ -63,7 +63,7 @@ So the kernel does its job; the wall is the code_predictor.
    PyTorch backbone on decode steps (prefill still PyTorch; PyTorch KV-cache
    length advanced with a dummy token/layer so HF position bookkeeping stays
    correct; kernel uses its own KV cache). Result: ~41 ms/step saved -> 18%
-   end-to-end. Verified by parity_kernel_replace.py (first 9 frames bit-identical
+   end-to-end. Verified by debug_tools/parity_kernel_replace.py (first 9 frames bit-identical
    to PyTorch greedy, then inaudible bf16 drift — same signature as the offline
    13/16 parity + ear test).
 

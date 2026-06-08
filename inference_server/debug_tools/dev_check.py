@@ -16,7 +16,7 @@ Run on the box (server stopped):
 import sys
 import os
 
-sys.path.insert(0, os.path.dirname(__file__))
+sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))  # inference_server/ (parent)
 
 from engine import StreamingTTSEngine  # noqa: E402
 
