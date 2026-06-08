@@ -1,18 +1,15 @@
 """
-diag_double.py — confirm the backbone is computed TWICE per step (PyTorch then
-kernel), wasting the kernel's speed.
+diag_double.py — answers TWO questions in one run:
 
-Hypothesis: the kernel runs as a forward HOOK on talker.model. A forward hook
-fires AFTER the module's own forward() has already run. So each step:
-  1. talker.model.forward() computes all 28 layers in PyTorch (~40 ms, WASTED)
-  2. post_hook runs the kernel (~1 ms) and overwrites the result
-The 41 ms/step "backbone (kernel)" we measured = mostly the discarded PyTorch
-backbone, NOT the kernel.
+(1) DEVICE CHECK: is the code_predictor (makes codes 1..15, ~76% of per-step
+    time) actually on the GPU, or accidentally on the CPU like the codec was?
+    If it's on cpu, that alone explains the ~173 ms/step we couldn't account for.
 
-This times, inside the post_hook, ONLY the kernel call (self._dfh + norm), and
-separately times the PyTorch forward that ran just before it. If pytorch_fwd is
-~40 ms and kernel_only is ~1 ms, the hypothesis is confirmed and the fix is to
-bypass PyTorch's backbone (run the kernel in place of forward, not after it).
+(2) DOUBLE-COMPUTE CHECK: the kernel runs as a forward HOOK on talker.model. A
+    hook fires AFTER the module's forward() already ran. So each step PyTorch may
+    compute all 28 backbone layers (~40 ms, WASTED) and then the hook runs the
+    kernel (~1 ms) and overwrites it. This times the PyTorch backbone fwd vs the
+    kernel call alone to confirm.
 
 Run on the box:
   cd /workspace/qwen-tts-0.6b-megakernel/inference_server
@@ -34,13 +31,39 @@ eng = StreamingTTSEngine()
 print(f"[diag] use_kernel={eng._use_kernel} device={eng.device}", flush=True)
 
 
+def dev(mod):
+    try:
+        for p in mod.parameters():
+            return p.device
+    except Exception as e:
+        return f"(no params: {e})"
+    return "no-params"
+
+
+# ---------- (1) DEVICE CHECK ----------
+m = eng.model
+talker = m.talker
+print("\n========== DEVICE CHECK ==========", flush=True)
+print(f"  talker                : {dev(talker)}", flush=True)
+print(f"  talker.model (backbone): {dev(talker.model)}", flush=True)
+cp = getattr(talker, "code_predictor", None)
+if cp is None:
+    # try common alt locations
+    cp = getattr(m, "code_predictor", None)
+print(f"  talker.code_predictor : {dev(cp) if cp is not None else 'NOT FOUND'}",
+      flush=True)
+print(f"  speech_tokenizer.model: {dev(m.speech_tokenizer.model)}", flush=True)
+print("  (anything on 'cpu' here is a bug — should all be cuda)", flush=True)
+print("==================================", flush=True)
+
+
+# ---------- (2) DOUBLE-COMPUTE CHECK ----------
 def sync():
     if torch.cuda.is_available():
         torch.cuda.synchronize()
 
 
-# time the PyTorch backbone forward (the thing that runs BEFORE the hook)
-tm = eng.model.talker.model
+tm = talker.model
 orig_fwd = tm.forward
 pytorch_fwd_ms = []
 
@@ -49,7 +72,6 @@ def timed_fwd(*a, **k):
     sync(); t0 = time.perf_counter()
     out = orig_fwd(*a, **k)
     sync()
-    # only count decode steps (seq len 1), not prefill
     try:
         if out.last_hidden_state.shape[1] == 1:
             pytorch_fwd_ms.append((time.perf_counter() - t0) * 1000)
@@ -60,7 +82,6 @@ def timed_fwd(*a, **k):
 
 tm.forward = timed_fwd
 
-# time ONLY the kernel call by wrapping self._dfh
 orig_dfh = eng._dfh
 kernel_only_ms = []
 
@@ -75,7 +96,7 @@ def timed_dfh(*a, **k):
 
 eng._dfh = timed_dfh
 
-print("[diag] warming up...", flush=True)
+print("\n[diag] warming up...", flush=True)
 for _ in eng.decode_stream("warm up", StreamConfig(max_new_tokens=16)):
     pass
 pytorch_fwd_ms.clear(); kernel_only_ms.clear()
@@ -99,7 +120,6 @@ print("========== DOUBLE-COMPUTE CHECK ==========", flush=True)
 stats("PyTorch backbone fwd/step", pytorch_fwd_ms)
 stats("kernel call only (_dfh)", kernel_only_ms)
 print("  ---", flush=True)
-print("  If PyTorch backbone ~40 ms and kernel ~1 ms: the PyTorch backbone runs", flush=True)
-print("  every step and is thrown away. Fix: run the kernel INSTEAD of PyTorch's", flush=True)
-print("  forward (skip it), not as an after-the-fact hook.", flush=True)
+print("  If PyTorch backbone ~40 ms and kernel ~1 ms: PyTorch backbone runs each", flush=True)
+print("  step and is thrown away. Fix: run the kernel INSTEAD of PyTorch forward.", flush=True)
 print("==========================================", flush=True)
