@@ -307,18 +307,33 @@ class StreamingTTSEngine:
             h.remove()
             self._hook_handle = None
 
-    # ---- megakernel backbone hooks (USE_KERNEL=1) ----
+    # ---- megakernel backbone: REPLACE PyTorch's forward (USE_KERNEL=1) ----
     def _install_kernel_backbone_hook(self):
-        """Run the megakernel 28-layer backbone each decode step in place of
-        PyTorch's layers. pre-hook captures inputs_embeds; post-hook seeds the
-        kernel KV cache from PyTorch's prefill (first decode step), runs
-        decode_from_hidden, and overwrites last_hidden_state with the kernel's
-        (pre-norm _hidden + PyTorch final norm — the faithful path). Verified
-        reference: megakernel/.../checks/kernel_in_loop.py.
+        """Run the megakernel backbone INSTEAD OF PyTorch's 28 layers on each
+        decode step (not as an after-the-fact hook).
+
+        Why a forward REPLACEMENT, not a forward hook: a forward hook fires AFTER
+        the module already ran all 28 PyTorch layers (~42 ms/step measured) — and
+        we then overwrote the result with the kernel (~1 ms). That wasted the 42
+        ms every step. By swapping `talker.model.forward` we skip the PyTorch
+        layers entirely on decode steps.
+
+        Correctness:
+          - PREFILL (seq len > 1): call the ORIGINAL forward. PyTorch builds the
+            real KV cache from the prompt; we seed the kernel's own KV cache from
+            it (once).
+          - DECODE (seq len == 1): run the kernel (`decode_from_hidden`) to get
+            the pre-norm hidden, apply PyTorch's final `norm` (the exact verified
+            path from kernel_in_loop.py), and ADVANCE PyTorch's DynamicCache
+            length by 1 with a dummy 1-token k/v per layer. The kernel keeps its
+            OWN kv cache (dec._k_cache) and never reads PyTorch's; only PyTorch's
+            cache *length* matters (HF derives cache_position from it), so the
+            dummy contents are never read. Verified by parity_kernel_replace.py.
         """
         talker_model = self.model.talker.model
         dec = self._kdec
-        st = {"seeded": False, "emb": None}
+        st = {"seeded": False}
+        orig_forward = talker_model.forward
 
         def _layer_kv(pkv, L):
             if hasattr(pkv, "layers"):
@@ -333,25 +348,36 @@ class StreamingTTSEngine:
                 kc[L, :, :n, :] = k[0, :, :n, :].to(kc.dtype)
                 vc[L, :, :n, :] = v[0, :, :n, :].to(vc.dtype)
 
-        def pre_hook(_m, args, kwargs):
+        def _advance_cache_len(pkv):
+            """Append a dummy 1-token k/v to every layer so get_seq_length()
+            advances by 1 without running the layers. The dummy is never read
+            (the kernel uses its own kv cache)."""
+            for L in range(len(pkv.layers)):
+                k0, _ = _layer_kv(pkv, L)
+                b, h, _t, d = k0.shape
+                dummy = torch.zeros((b, h, 1, d), dtype=k0.dtype, device=k0.device)
+                pkv.update(dummy, dummy, L)
+
+        def kernel_forward(*args, **kwargs):
             emb = kwargs.get("inputs_embeds")
             if emb is None and args:
                 emb = args[0]
-            st["emb"] = emb
-
-        def post_hook(_m, _a, _kw, output):
-            hs = output.last_hidden_state
-            if hs.shape[1] != 1:          # prefill — PyTorch handles it
-                return output
-            pkv = output.past_key_values
-            pos = pkv.get_seq_length() - 1
+            # prefill (or no embeds) -> let PyTorch do it (and seed the kernel kv)
+            if emb is None or emb.shape[1] != 1:
+                out = orig_forward(*args, **kwargs)
+                return out
+            pkv = kwargs.get("past_key_values")
+            if pkv is None:
+                # safety: can't advance an unknown cache -> fall back to PyTorch
+                return orig_forward(*args, **kwargs)
             if not st["seeded"]:
                 _seed(pkv)
                 st["seeded"] = True
-            emb = st["emb"].detach().to(torch.bfloat16).reshape(-1).contiguous()
+            pos = pkv.get_seq_length()          # tokens so far == position of new token
+            flat = emb.detach().to(torch.bfloat16).reshape(-1).contiguous()
             dec._position = pos
             self._dfh(
-                dec._out_token, emb,
+                dec._out_token, flat,
                 dec._embed_weight, dec._layer_weights_packed,
                 dec._final_norm_weight, dec._lm_head_weight,
                 dec._cos_table, dec._sin_table, dec._k_cache, dec._v_cache,
@@ -361,20 +387,24 @@ class StreamingTTSEngine:
                 28, pos, dec._k_cache.shape[2], dec._attn_scale,
             )
             k_pre = dec._hidden.detach().to(torch.bfloat16).view(1, 1, -1)
-            output.last_hidden_state = talker_model.norm(k_pre)
-            return output
+            last_hidden = talker_model.norm(k_pre)
+            _advance_cache_len(pkv)             # keep HF's position bookkeeping right
+            from transformers.modeling_outputs import BaseModelOutputWithPast
+            return BaseModelOutputWithPast(
+                last_hidden_state=last_hidden,
+                past_key_values=pkv,
+                hidden_states=None,
+                attentions=None,
+            )
 
-        self._k_pre_handle = talker_model.register_forward_pre_hook(
-            pre_hook, with_kwargs=True)
-        self._k_post_handle = talker_model.register_forward_hook(
-            post_hook, with_kwargs=True)
+        self._orig_backbone_forward = orig_forward
+        talker_model.forward = kernel_forward
 
     def _remove_kernel_backbone_hook(self):
-        for attr in ("_k_pre_handle", "_k_post_handle"):
-            h = getattr(self, attr, None)
-            if h is not None:
-                h.remove()
-                setattr(self, attr, None)
+        orig = getattr(self, "_orig_backbone_forward", None)
+        if orig is not None:
+            self.model.talker.model.forward = orig
+            self._orig_backbone_forward = None
 
     # ---- batched reference path (used by parity_check) ----
     def generate_batched_codes(self, text: str, cfg: Optional[StreamConfig] = None):
