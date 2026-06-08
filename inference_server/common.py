@@ -81,6 +81,27 @@ def load_model(device: str | None = None):
     model = model.to(device)
     model.eval()
 
+    # IMPORTANT: model.to(device) does NOT move the speech_tokenizer (the codec
+    # that turns codes -> waveform). It is a Qwen3TTSTokenizer *wrapper* whose
+    # actual network lives in `.model`, and it is not reached by the top-level
+    # .to(). Left on the CPU it runs the whole decode on the CPU — ~13 s/call,
+    # with the GPU doing ~0 ms of work (proven via torch.profiler). Move it to
+    # the GPU explicitly and update the wrapper's recorded device (the wrapper
+    # uses self.device to place its inputs). This drops codec decode from ~13 s
+    # to a few ms and is what makes streaming viable.
+    st = getattr(model, "speech_tokenizer", None)
+    if st is not None and getattr(st, "model", None) is not None:
+        try:
+            st.model = st.model.to(device).eval()
+            # the wrapper places inputs on self.device; keep it in sync
+            if hasattr(st, "device"):
+                st.device = torch.device(device)
+            codec_dev = next(st.model.parameters()).device
+            print(f"[common] moved speech_tokenizer (codec) to {codec_dev}")
+        except Exception as e:
+            print(f"[common] WARNING: could not move codec to {device}: {e!r} "
+                  "(codec decode will be slow on CPU)")
+
     processor = AutoProcessor.from_pretrained(MODEL_ID, fix_mistral_regex=True)
     print("[common] model + processor ready.")
     return model, processor, device
