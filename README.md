@@ -76,55 +76,96 @@ flowchart LR
 
 # The megakernel: how it speeds up Qwen3-TTS
 
-The kernel is AlpinDale's `qwen_megakernel` (a single fused CUDA kernel that runs
-the Qwen3-0.6B transformer) **ported to the Qwen3-TTS talker backbone**. The
-backbone has the same shape as Qwen3-0.6B (28 layers / 1024 dim / 8 KV heads /
-head-dim 128 / RMSNorm eps 1e-6), so the per-step machinery is reused; only a few
-things differ for the talker.
+### First, what's a "megakernel"?
 
-### Changes made to port the kernel to the talker
+When a model runs normally in PyTorch, each layer is a separate GPU operation
+("kernel"). A 28-layer transformer launches *hundreds* of tiny GPU operations per
+step, and the GPU spends a lot of time waiting between them (launch overhead, and
+reading/writing memory over and over).
 
-| Change | Text Qwen3-0.6B | Qwen3-TTS talker | Why |
-|--------|-----------------|------------------|-----|
-| **RoPE theta** | `10_000` | **`1_000_000`** | The talker backbone uses a 1e6 rotary base; using the text 1e4 gives wrong positions. Set in `model_tts.py` (`ROPE_THETA`) and the kernel's cos/sin tables. |
-| **Output vocab** | `151936` | **`3072`** | The talker's LM head is `codec_head` (codebook-0, 3072 entries), not the text vocab. The kernel's LM-head size is a build flag `-DLDG_VOCAB_SIZE=3072`; using 151936 reads out of bounds (illegal memory access). |
-| **Untied I/O head** | embed tied to LM head | **untied** | Talker input embed = `talker.model.codec_embedding`; output head = `talker.codec_head` — two *separate* tensors. The kernel was given both. |
-| **Input is a hidden vector, not a token id** | layer-0 reads `embed[token_id]` | **`decode_from_hidden`** | The talker feeds the backbone a *summed code-embedding* (a hidden vector), not a token id. A new CUDA op `decode_from_hidden` makes layer 0 read a hidden vector directly (bit-identical to the token path). |
-| **MRoPE** | 1D RoPE | collapses to 1D | The talker's 3-section MRoPE positions are identical on the decode path, so plain 1D RoPE is exact — no kernel rewrite needed (verified). |
+A **megakernel** fuses the *entire* transformer into **one** giant GPU program.
+The whole 28-layer forward pass runs in a single launch, keeping data in fast
+on-chip memory instead of bouncing to slow global memory between layers. The
+result: the talker **backbone** runs in **~1 millisecond per step** instead of
+~40+ ms in PyTorch.
 
-### Two performance bugs found and fixed in the server integration
+We started from AlpinDale's [`qwen_megakernel`](https://github.com/AlpinDale/qwen_megakernel)
+(a megakernel for the **text** model, Qwen3-0.6B) and **ported it to the Qwen3-TTS
+talker backbone**. We could reuse most of it because the talker backbone is the
+same *shape* as Qwen3-0.6B (28 layers, 1024 hidden dim, 8 key/value heads,
+head-dim 128). Only a handful of things are different for the TTS model — those
+are the changes below.
 
-These were found by profiling, not guessing (the diagnostic scripts live in
-`inference_server/debug_tools/`):
+### What we changed to make it work for Qwen3-TTS
 
-1. **The codec was running on the CPU.** `model.to("cuda")` does **not** move the
-   `speech_tokenizer` (the codec) — it's a `Qwen3TTSTokenizer` *wrapper* whose
-   real network lives in `.model`, which the top-level `.to()` never reaches. Left
-   on the CPU, the codec decode took **~13 s/call** with the GPU doing ~0 ms of
-   work (proven with `torch.profiler`: 13.7 s wall, ~0 ms CUDA, dominated by
-   CPU↔GPU copies). This *looked* like a streaming hang. **Fix:** in
-   `common.load_model()`, explicitly `speech_tokenizer.model.to("cuda")` and sync
-   the wrapper's `.device`. Codec decode: **~13000 ms → ~28 ms (≈450×).**
+Each row is "the text model did X, but the TTS talker needs Y, so we changed Z."
+Don't worry if some terms are unfamiliar — the **Why** column explains what would
+break if we *didn't* make the change.
 
-2. **The backbone was computed twice per step.** The kernel first ran as a forward
-   *hook*, which fires **after** PyTorch already ran all 28 layers (~42 ms/step) —
-   so PyTorch's backbone ran every step and was thrown away, wasting the kernel's
-   speed. **Fix:** the kernel now **replaces** `talker.model.forward` on decode
-   steps (PyTorch handles prefill and seeds the kernel's KV cache; the PyTorch KV
-   cache length is advanced with a dummy token/layer so HF's position bookkeeping
-   stays correct; the kernel uses its own KV cache). **≈18 % faster end-to-end.**
+| What | Text model (Qwen3-0.6B) | TTS talker | Why it matters (plain terms) |
+|------|-------------------------|------------|------------------------------|
+| **RoPE theta** (how the model encodes word *position*) | `10,000` | **`1,000,000`** | "RoPE" is how the model knows the order of tokens. The TTS talker was trained with a different base number (1,000,000). If you leave it at the text value, the model thinks every position is wrong and produces garbage. We set the right value in both the Python code and the kernel's lookup tables. |
+| **Output vocabulary size** (how many possible outputs) | `151,936` words | **`3,072`** codes | The text model picks from ~152k words; the TTS talker picks from only 3,072 audio "codes". The kernel had the word-count hard-coded. With the wrong (bigger) number it reads past the end of the weights array → instant GPU crash. We made it a build flag: `-DLDG_VOCAB_SIZE=3072`. |
+| **Separate input/output tables** | input & output share one table | **two separate tables** | The text model uses one table both to read tokens in and write predictions out ("tied"). The TTS talker uses two different tables (`codec_embedding` in, `codec_head` out — "untied"). We hand the kernel both. |
+| **Input is a vector, not a token number** | layer 0 looks up `embedding[token_id]` | **a ready-made vector** | The text kernel starts from a token *number* and looks up its vector. But the TTS talker hands the backbone an already-computed vector (a sum of the previous codes' embeddings). We added a new GPU op, **`decode_from_hidden`**, that lets the kernel start from a vector directly. We verified it gives bit-for-bit identical results to the original path. |
+| **MRoPE** (3-part position scheme) | plain 1D positions | collapses to 1D | The TTS model has a fancier 3-part position scheme ("MRoPE"). We checked, and on the step-by-step decode path all 3 parts are identical — so plain positions are exactly correct and no kernel rewrite was needed. |
 
-A `first_hop=1` setting also emits the first audio chunk after 1 frame instead of
-4, cutting time-to-first-chunk (TTFC) ~2.7× with no change to steady-state speed.
+### Two performance bugs we found by measuring (not guessing)
 
-### Correctness
+When we first plugged the kernel into the server, audio generation *looked* like
+it was hanging. Instead of guessing, we profiled it. The diagnostic scripts that
+found these live in `inference_server/debug_tools/`.
 
-The ported kernel is verified, not assumed: single-layer parity (max abs diff
-0.0078), exact codebook-0 parity, a 16-code frame matching 13/16 (first 12 exact;
-the tail drifts by bf16 rounding and is **inaudible** — confirmed by an ear
-test), and an in-server greedy parity check (first 9 frames bit-identical to
-PyTorch, then the same inaudible drift). See `megakernel/README.md` and
-`megakernel/docs/`.
+**Bug 1 — the codec was secretly running on the CPU (≈450× slower).**
+
+The "codec" is the part that turns audio codes into actual sound. We thought it
+was on the GPU, but it was running on the CPU the whole time — taking **~13
+seconds per call** while the GPU sat idle. (We proved it with PyTorch's profiler:
+13.7 s of wall-clock time, but ~0 ms of *GPU* time — almost all of it was data
+being copied back and forth between CPU and GPU.)
+
+Why did this happen? In PyTorch you move a model to the GPU with
+`model.to("cuda")`. But the codec (`speech_tokenizer`) is a **wrapper object** —
+its actual neural network is tucked inside `.model`, and the top-level
+`model.to("cuda")` **doesn't reach into it**. So it silently stayed on the CPU.
+
+**The fix** (in `common.load_model()`): explicitly move the codec's inner network
+to the GPU — `speech_tokenizer.model.to("cuda")` — and update the wrapper's
+device flag. Codec time dropped from **~13,000 ms → ~28 ms** per call.
+
+**Bug 2 — the backbone was being computed twice every step.**
+
+Our first attempt ran the kernel as a "hook" — code that runs *after* a function
+finishes. But a hook fires **after** PyTorch has *already* run all 28 backbone
+layers (~42 ms). So every step did the slow PyTorch backbone, then ran the fast
+kernel and **threw the PyTorch result away.** We were paying for both and keeping
+only one — wasting the kernel's whole advantage.
+
+**The fix:** make the kernel **replace** the backbone's forward pass instead of
+running after it, so the slow PyTorch version never runs on decode steps. (One
+subtlety: PyTorch tracks how many tokens it has seen via its "KV cache"; since we
+skip its layers, we nudge that counter forward by one each step so the rest of
+the model still keeps its place. The kernel keeps its own KV cache for the real
+work.) Result: **~18% faster end-to-end.**
+
+**Bonus — faster first word.** The codec normally waits for 4 frames before
+emitting any sound. We made it emit after the *first* frame (`first_hop=1`), so
+you hear the voice start much sooner. Time-to-first-chunk dropped ~2.7× (837 ms →
+312 ms) with no change to overall speed.
+
+### How we know the kernel is correct (not just fast)
+
+A fast kernel that produces wrong audio is useless, so we verified it at every
+step:
+- **Single layer** matches PyTorch to within tiny rounding (max difference 0.0078).
+- **Codebook-0** output is exactly identical.
+- A full **16-code frame** matches 13/16 codes (the first 12 exact; the last few
+  drift only by tiny `bfloat16` rounding — and an **ear test** confirmed this
+  drift is **inaudible**).
+- An **in-server check** confirmed the first 9 frames are bit-for-bit identical to
+  plain PyTorch, then the same inaudible rounding drift.
+
+Details in `megakernel/README.md` and `megakernel/docs/`.
 
 ## Benchmarks
 
