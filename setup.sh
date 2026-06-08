@@ -35,14 +35,19 @@ python -c "import torch,sys; sys.exit(0 if torch.cuda.is_available() and '5090' 
   || die "torch can't see the GPU — do NOT use 'uv run' (CPU-only env); use system python."
 
 bold "2/3  Install deps (without disturbing the box's CUDA torch)"
-# --no-deps on qwen-tts/transformers so they can't drag torch/torchvision around;
-# but transformers 4.57.3 needs huggingface_hub <1.0 and accelerate 1.12.0, so we
-# pin those explicitly (the box ships hub 1.8.0 + accelerate 1.13.0, which are too
-# new and make transformers fail to import). torch/torchvision left untouched.
-pip install -q --no-deps "qwen-tts==0.1.1" "transformers==4.57.3" || die "core install failed"
-pip install -q "huggingface_hub>=0.34.0,<1.0" "accelerate==1.12.0" \
+# transformers MUST install its own deps (huggingface_hub, tokenizers, etc.) —
+# using --no-deps leaves it half-broken (GGUF_CONFIG_MAPPING / AutoProcessor
+# import errors). So install transformers WITH deps. Only qwen-tts gets --no-deps
+# (so it can't pin transformers back to a version that fights the model). We do
+# NOT install/upgrade torch or torchvision — the box's CUDA build stays.
+pip install -q "transformers==4.57.3" || die "transformers install failed"
+pip install -q --no-deps "qwen-tts==0.1.1" || die "qwen-tts install failed"
+pip install -q "accelerate==1.12.0" \
                librosa torchaudio onnxruntime einops soundfile ninja \
+               sox gradio \
                fastapi uvicorn websockets || die "runtime deps install failed"
+# qwen_tts imports the `sox` python pkg, which needs the system sox binary.
+command -v sox >/dev/null 2>&1 || apt-get install -y sox libsox-dev >/dev/null 2>&1 || true
 pip install -q "pipecat-ai[webrtc,deepgram,silero,runner]==1.3.0" openai python-dotenv \
   || echo "  (pipecat deps failed — fine if you only need the inference server)"
 python -c "from transformers import AutoProcessor; from qwen_tts import Qwen3TTSModel" \
