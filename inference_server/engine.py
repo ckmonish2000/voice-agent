@@ -193,8 +193,28 @@ class StreamingTTSEngine:
             top_k=cfg.top_k,
         )
 
-        frame_q: "queue.Queue" = queue.Queue()
-        self._install_frame_hook(frame_q, metrics)
+        # PCM queue carries finished audio bytes (NOT raw frames). All GPU work —
+        # backbone, code_predictor AND codec decode — runs on the worker thread,
+        # serialized by generate()'s own loop (the codec decode happens inside the
+        # frame hook, which fires synchronously on the worker thread each step).
+        # The foreground does ZERO GPU work; it only drains bytes off the queue.
+        #
+        # Why: a single process-wide CUDA context is shared by all threads. The
+        # earlier design ran generate() on a worker thread and the codec decode on
+        # the foreground thread — two threads issuing GPU work concurrently, which
+        # deadlocked (worker froze mid-generate, codec blocked, no PCM ever out;
+        # see diag_hang.py: 13 frames produced, 0 chunks emitted, both threads
+        # alive but stuck). Keeping every CUDA call on ONE thread (the way the
+        # verified kernel_in_loop.py does) fixes it while preserving streaming.
+        pcm_q: "queue.Queue" = queue.Queue()
+        decoder = _SlidingCodecDecoder(
+            self.model.speech_tokenizer,
+            ref_code=self._voice["ref_code"].to(self.device),
+            window=cfg.window,
+            hop=cfg.hop,
+            device=self.device,
+        )
+        self._install_frame_hook(pcm_q, metrics, decoder)
         if self._use_kernel:
             self._install_kernel_backbone_hook()
 
@@ -209,46 +229,50 @@ class StreamingTTSEngine:
                         non_streaming_mode=False,
                         **gen_kwargs,
                     )
+                # generation finished: flush the codec tail (still on this thread,
+                # the only thread that touches the GPU).
+                tail = decoder.flush()
+                if tail is not None and len(tail) > 0:
+                    pcm_q.put(tail)
+            except Exception as e:  # surface worker crashes instead of hanging
+                import traceback
+                traceback.print_exc()
+                pcm_q.put(("__error__", repr(e)))
             finally:
-                frame_q.put(_FRAME_SENTINEL)
+                pcm_q.put(_FRAME_SENTINEL)
 
         worker = threading.Thread(target=_run_generate, daemon=True)
         worker.start()
 
-        # Foreground: drain frames, sliding-window codec decode, emit PCM tail.
-        decoder = _SlidingCodecDecoder(
-            self.model.speech_tokenizer,
-            ref_code=self._voice["ref_code"].to(self.device),
-            window=cfg.window,
-            hop=cfg.hop,
-            device=self.device,
-        )
+        # Foreground: drain finished PCM bytes only — no GPU work here.
         try:
             while True:
-                frame = frame_q.get()
-                if frame is _FRAME_SENTINEL:
+                item = pcm_q.get()
+                if item is _FRAME_SENTINEL:
                     break
-                pcm = decoder.push(frame.to(self.device))
-                if pcm is not None and len(pcm) > 0:
-                    yield pcm
-            tail = decoder.flush()
-            if tail is not None and len(tail) > 0:
-                yield tail
+                if isinstance(item, tuple) and item and item[0] == "__error__":
+                    raise RuntimeError(f"generation worker failed: {item[1]}")
+                if item is not None and len(item) > 0:
+                    yield item
         finally:
             metrics.last_frame_t = time.perf_counter()
-            worker.join(timeout=1.0)
+            worker.join(timeout=5.0)
             self._remove_frame_hook()
             if self._use_kernel:
                 self._remove_kernel_backbone_hook()
 
-    # ---- frame hook: push each step's 16-code frame onto the queue ----
-    def _install_frame_hook(self, frame_q: "queue.Queue", metrics: StreamMetrics):
-        """Push each generated frame to the queue as the talker produces it.
+    # ---- frame hook: decode each step's frame to PCM on the worker thread ----
+    def _install_frame_hook(self, pcm_q: "queue.Queue", metrics: StreamMetrics,
+                            decoder: "_SlidingCodecDecoder"):
+        """Decode each generated frame to PCM as the talker produces it, then
+        push the finished bytes onto the queue.
 
         talker.forward returns hidden_states=(layer_hidden_states, codec_ids).
         On generate steps (seq len 1) codec_ids is the (1,16) frame for this
-        step; on the prefill step it is None. We forward each real frame
-        immediately, skipping the EOS frame.
+        step; on the prefill step it is None. We feed each real frame to the
+        sliding-window codec decoder *here* — i.e. on the same (worker) thread
+        that runs generate(), so every CUDA call is serialized on one thread.
+        The EOS frame is skipped.
         """
         talker = self.model.talker
         eos = self._eos
@@ -261,7 +285,7 @@ class StreamingTTSEngine:
             codec_ids = hs[1]
             if codec_ids is None:
                 return output  # prefill step
-            frame = codec_ids.detach().to("cpu").view(-1)[:16]
+            frame = codec_ids.detach().view(-1)[:16]
             if int(frame[0]) == eos:
                 return output
             now = time.perf_counter()
@@ -269,7 +293,10 @@ class StreamingTTSEngine:
                 metrics.first_frame_t = now
             metrics.frame_arrival_ts.append(now)
             metrics.num_frames += 1
-            frame_q.put(frame.clone())
+            # codec decode on THIS (worker) thread — emit PCM tail if a hop is ready
+            pcm = decoder.push(frame.to(self.device))
+            if pcm is not None and len(pcm) > 0:
+                pcm_q.put(pcm)
             return output
 
         self._hook_handle = talker.register_forward_hook(_hook)
