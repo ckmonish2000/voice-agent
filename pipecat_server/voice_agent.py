@@ -52,14 +52,32 @@ def build_pipeline_task(transport) -> PipelineTask:
         sample_rate=SR,
         # Jitter-buffer pre-roll (seconds) before playback starts. Tune via env:
         # smaller = lower latency but riskier underrun; larger = smoother but more
-        # initial delay. Default 2.5s suits short replies on the slow MPS model.
-        preroll_secs=float(os.environ.get("QWEN_TTS_PREROLL", "2.5")),
+        # initial delay. Default 8s = V1 buffered (smooth) as the starting mode;
+        # the UI can toggle to V2 realtime (preroll 0) live via "set-mode".
+        preroll_secs=float(os.environ.get("QWEN_TTS_PREROLL", "8.0")),
     )
 
     context = LLMContext(messages=[{"role": "system", "content": SYSTEM_PROMPT}])
     aggregators = LLMContextAggregatorPair(context)
 
     rtvi = RTVIProcessor()
+
+    # UI toggle: V1 buffered <-> V2 realtime streaming. The browser sends an RTVI
+    # client message {type: "set-mode", data: {realtime: bool}}; we flip the TTS
+    # service's preroll live (applies to the next utterance) and echo the state
+    # back so the button can reflect it.
+    @rtvi.event_handler("on_client_message")
+    async def _on_client_message(_proc, msg):
+        if getattr(msg, "type", None) == "set-mode":
+            realtime = bool((msg.data or {}).get("realtime", False))
+            tts.set_realtime(realtime)
+            mode = "realtime (V2)" if realtime else "buffered (V1)"
+            print(f"[voice_agent] TTS mode -> {mode}")
+            try:
+                await rtvi.send_server_message(
+                    {"type": "mode-changed", "realtime": realtime})
+            except Exception:
+                pass
 
     processors = [
         transport.input(),

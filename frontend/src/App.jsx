@@ -6,6 +6,7 @@ export default function App() {
   const [botSpeaking, setBotSpeaking] = useState(false);
   const [talking, setTalking] = useState(false); // is the Speak button currently held?
   const [lines, setLines] = useState([]); // {who:"You"|"Bot", text}
+  const [realtime, setRealtime] = useState(false); // false=V1 buffered, true=V2 realtime
   const clientRef = useRef(null);
   const audioRef = useRef(null); // <audio> element that plays the bot's voice
 
@@ -86,6 +87,10 @@ export default function App() {
       onBotTranscript: (data) => {
         if (data?.text) addLine("Bot", data.text);
       },
+      onServerMessage: (data) => {
+        // server confirms the active TTS mode
+        if (data?.type === "mode-changed") setRealtime(!!data.realtime);
+      },
       onError: (e) => {
         console.error(e);
         addLine("Bot", "[error] " + (e?.message || "connection failed"));
@@ -100,6 +105,20 @@ export default function App() {
       setStatus("disconnected");
     }
   }, [addLine, playBotTrack]);
+
+  // Toggle V1 (buffered, smooth) <-> V2 (realtime streaming). Sends an RTVI
+  // client message; the server flips the TTS preroll for the next utterance.
+  const toggleMode = useCallback(() => {
+    const client = clientRef.current;
+    if (!client || status !== "connected") return;
+    const next = !realtime;
+    setRealtime(next); // optimistic; server echoes "mode-changed" to confirm
+    try {
+      client.sendClientMessage("set-mode", { realtime: next });
+    } catch (e) {
+      console.error("set-mode failed", e);
+    }
+  }, [realtime, status]);
 
   const disconnect = useCallback(async () => {
     await clientRef.current?.disconnect();
@@ -161,6 +180,30 @@ export default function App() {
         )}
         <span>Status: <b>{status}</b></span>
         <span>{connected ? (botSpeaking ? "🔊 bot speaking" : talking ? "🔴 sending" : "🎤 idle") : ""}</span>
+      </div>
+
+      {/* V1 buffered (smooth) <-> V2 realtime streaming toggle. */}
+      <div style={{ display: "flex", gap: 12, alignItems: "center", marginBottom: 16 }}>
+        <button
+          onClick={toggleMode}
+          disabled={!connected}
+          style={{
+            padding: "8px 14px",
+            borderRadius: 8,
+            border: "1px solid #ccc",
+            cursor: connected ? "pointer" : "not-allowed",
+            background: realtime ? "#1f6feb" : "#2da44e",
+            color: "#fff",
+            fontWeight: 600,
+          }}
+        >
+          {realtime ? "Mode: V2 Realtime streaming" : "Mode: V1 Buffered (smooth)"}
+        </button>
+        <span style={{ color: "#666", fontSize: 13 }}>
+          {realtime
+            ? "each chunk plays as it arrives (may stutter at RTF>1)"
+            : "buffers the reply, then plays smoothly"}
+        </span>
       </div>
 
       {/* Push-to-talk button: mic is live only while this is held down. */}

@@ -45,12 +45,32 @@ class QwenWSTTSService(TTSService):
         self._uri = uri
         self._sample_rate = sample_rate
         # Jitter buffer pre-roll: seconds of audio to accumulate before playback.
-        # DEFAULT 0.0 = pure frame-by-frame streaming (no buffering) — correct for
-        # the RTX 5090 server (RTF ~0.5, generates faster than real time, so the
-        # transport never underruns). Raise it (e.g. QWEN_TTS_PREROLL=2.5) only for
-        # slow backends (Mac/MPS) where streaming each chunk would break up.
+        #   0.0  = V2 pure frame-by-frame streaming (no buffering). Honest realtime
+        #          streaming, but at RTF>1 (codec slower than realtime) the browser
+        #          plays faster than we generate -> audio underruns / stutters.
+        #   >0   = V1 buffered: accumulate this many seconds before playback so the
+        #          cushion covers the gap and audio is smooth.
         # Converted to bytes: sample_rate * 2 bytes/sample (int16) * 1 channel.
+        # Runtime-mutable via set_realtime() so the UI can toggle V1<->V2 live.
+        self._buffered_preroll_secs = preroll_secs if preroll_secs > 0 else 8.0
         self._preroll_bytes = int(preroll_secs * sample_rate * 2)
+
+    def set_realtime(self, realtime: bool) -> None:
+        """Toggle V2 realtime streaming (no buffer) vs V1 buffered playback.
+
+        realtime=True  -> preroll 0  (stream each chunk as it arrives; may stutter)
+        realtime=False -> preroll _buffered_preroll_secs (smooth, buffered start)
+        Applies to the NEXT utterance.
+        """
+        if realtime:
+            self._preroll_bytes = 0
+        else:
+            self._preroll_bytes = int(
+                self._buffered_preroll_secs * self._sample_rate * 2)
+
+    @property
+    def is_realtime(self) -> bool:
+        return self._preroll_bytes == 0
 
     def can_generate_metrics(self) -> bool:
         return True
