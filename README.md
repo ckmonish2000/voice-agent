@@ -207,6 +207,11 @@ whole pipeline is ~18 % faster with it on. The real-time targets (RTF<0.15) are
 the backbone kernel's scope. The clear next step to approach real time is a
 megakernel for the code_predictor, not the backbone.
 
+> **Where the next big win is:** the **majority** of any further Qwen3-TTS speedup
+> has to come from the **code_predictor** (~76 % of each frame), which the current
+> megakernel does **not** cover. Writing a megakernel for the code_predictor is
+> our planned next step — that's where the real-time gains are.
+
 ---
 
 # Setup
