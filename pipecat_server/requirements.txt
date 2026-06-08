@@ -1,0 +1,41 @@
+# Requirements for the Pipecat voice agent (pipecat_server/).
+#
+# This is the orchestrator that runs on your LAPTOP/Mac (not the GPU box): it
+# captures mic audio in the browser via WebRTC, runs STT (Deepgram) and the LLM
+# (OpenAI) as cloud calls, and sends text to the inference server over a
+# WebSocket (which streams PCM back). It does NOT need torch, the model, or a GPU.
+#
+# Install (use a normal venv, NOT `uv run`):
+#   python -m venv .venv && source .venv/bin/activate
+#   pip install -r pipecat_server/requirements.txt
+#
+# Then provide keys in the repo-root .env:
+#   DEEPGRAM_API_KEY=...
+#   OPENAI_API_KEY=...
+# and run:
+#   QWEN_TTS_URI=ws://localhost:8000/tts python pipecat_server/server.py -t webrtc
+#
+# NOTE: the full project's root requirements.txt already includes all of these
+# (it covers the box too). This file is the minimal subset for running ONLY the
+# pipecat server on a machine that doesn't need the model/kernel.
+
+# Pipecat with the extras this server actually uses:
+#   webrtc   -> SmallWebRTC transport (browser <-> server) + the /client runner UI
+#   deepgram -> DeepgramSTTService (speech -> text)
+#   silero   -> VAD / turn-taking support pulled in by the pipeline
+#   runner   -> pipecat.runner.run (server.py entrypoint, offer/answer endpoint)
+# Pinned to 1.3.0: voice_agent.py uses 1.3.0 APIs (LLMContext, RTVI
+# on_client_message / send_server_message, TTSSettings).
+pipecat-ai[webrtc,deepgram,silero,runner]==1.3.0
+
+# OpenAI LLM service (OpenAILLMService, model gpt-4o-mini).
+openai>=2.0,<3
+
+# Loads the repo-root .env (DEEPGRAM_API_KEY, OPENAI_API_KEY).
+python-dotenv>=1.0
+
+# WebSocket client to the inference server (qwen_ws_tts.py).
+websockets>=12
+
+# Known-good versions on this project (2026-06): pipecat-ai 1.3.0, openai 2.38.0,
+# python-dotenv 1.2.2, websockets 16.0.

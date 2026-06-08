@@ -26,6 +26,8 @@ uvicorn
 websockets
 
 # --- Pipecat voice agent (STT -> LLM -> TTS) ---
+# (To run ONLY the pipecat server on a laptop without the model/kernel, use the
+#  minimal pipecat_server/requirements.txt instead of this whole file.)
 pipecat-ai[webrtc,deepgram,silero,runner]==1.3.0
 openai
 python-dotenv
