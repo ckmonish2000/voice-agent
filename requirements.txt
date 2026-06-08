@@ -1,22 +1,34 @@
-# Python dependencies for the inference server + Pipecat server.
-# Install into a virtualenv:  python -m venv .venv && .venv/bin/pip install -r requirements.txt
-# Versions below match what this project was developed and tested against.
+# Single requirements file for the whole project:
+#   - megakernel checks (CUDA kernel + parity tests)
+#   - inference server (Qwen3-TTS streaming /tts)
+#   - Pipecat server (STT -> LLM -> TTS voice agent)
+#
+# INSTALL ON THE GPU BOX WITH:  bash setup.sh   (recommended — handles ordering)
+# or manually:                  pip install -r requirements.txt
+#
+# CRITICAL — do NOT let pip touch the box's CUDA torch:
+#   The Vast CUDA image ships a CUDA-matched torch + torchvision (e.g. 2.11.0+cu130).
+#   We deliberately DO NOT pin torch/torchvision here — pinning/upgrading them
+#   breaks torchvision's compiled ops (the "torchvision::nms does not exist" error)
+#   and forces CPU loads. Use the pre-installed torch. setup.sh installs the rest
+#   with --no-deps where needed so nothing drags torch/transformers around.
+#
+# transformers is pinned to what qwen-tts 0.1.1 requires (4.57.3). Newer
+# transformers (5.x) breaks qwen_tts's check_model_inputs decorator.
 
-# --- Inference server (Qwen3-TTS model) ---
-# qwen-tts is the model package the engine/loader import (`from qwen_tts import
-# Qwen3TTSModel`). It brings its own deps: accelerate, einops, librosa,
-# torchaudio, transformers, soundfile, onnxruntime, sox, gradio.
+# --- model + inference server ---
 qwen-tts==0.1.1
-torch==2.12.0
 transformers==4.57.3
-numpy==2.4.6
-soundfile==0.13.1
-fastapi==0.136.3
-uvicorn==0.48.0
-websockets==16.0
+soundfile
+ninja                # required to JIT-compile the megakernel (csrc/kernel.cu)
+fastapi
+uvicorn
+websockets
 
-# --- Pipecat server (voice pipeline) ---
-# The extras pull in: aiortc (SmallWebRTC), Deepgram STT, Silero VAD, the runner.
+# --- Pipecat voice agent (STT -> LLM -> TTS) ---
 pipecat-ai[webrtc,deepgram,silero,runner]==1.3.0
-openai==2.38.0
-python-dotenv==1.2.2
+openai
+python-dotenv
+
+# NOTE: torch / torchvision intentionally omitted — use the box image's CUDA build.
+#       qwen-tts also pulls accelerate/librosa/torchaudio/onnxruntime transitively.
